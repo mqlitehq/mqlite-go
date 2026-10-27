@@ -94,6 +94,9 @@ func (s *fakeReceiveSource) deferMsg(ctx context.Context, queue string, seq int6
 }
 
 func (s *fakeReceiveSource) renew(ctx context.Context, queue string, seq int64, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.recordSettle(settleRecord{op: "renew", queue: queue, seq: seq, token: token})
 }
 
@@ -358,6 +361,9 @@ func TestReceiverAutoRenewsAndAbandonsHandlerFailure(t *testing.T) {
 	if renews == 0 || abandons != 1 || completes != 0 {
 		t.Fatalf("settlements = %+v", settles)
 	}
+	if settles[len(settles)-1].op != "abandon" {
+		t.Fatalf("renewal overlapped terminal settlement: %+v", settles)
+	}
 }
 
 func TestAutoRenewIntervalStaysInsideShortLease(t *testing.T) {
@@ -453,11 +459,42 @@ func TestReceiverRetriesOneTransientRenewFailure(t *testing.T) {
 			completes++
 		}
 	}
-	if renews != 2 || completes != 1 {
+	if renews < 2 || completes != 1 {
 		t.Fatalf("settlements = %+v", settles)
+	}
+	if settles[len(settles)-1].op != "complete" {
+		t.Fatalf("renewal overlapped terminal settlement: %+v", settles)
 	}
 	if got := atomic.LoadInt32(&observed); got != 1 {
 		t.Fatalf("error notifications = %d, want 1", got)
+	}
+}
+
+func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing.T) {
+	source := &fakeReceiveSource{}
+	source.renewFn = func(int) error { return ErrPermissionDenied }
+	var returned int32
+	source.receiveFn = func(ctx context.Context, call int, record receiveRecord) ([]*Message, error) {
+		if atomic.CompareAndSwapInt32(&returned, 0, 1) {
+			message := source.message(11)
+			message.LockedUntil = time.Now().Add(20 * time.Millisecond)
+			return []*Message{message}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew()})
+	err := receiver.Run(context.Background(), func(ctx context.Context, _ *Message) error {
+		<-ctx.Done()
+		return nil
+	})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("Run error = %v, want ErrPermissionDenied", err)
+	}
+	settles := source.settleSnapshot()
+	if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
+		t.Fatalf("settlements = %+v", settles)
 	}
 }
 

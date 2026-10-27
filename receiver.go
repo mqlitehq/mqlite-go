@@ -221,13 +221,26 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 }
 
 func (r *Receiver) process(ctx context.Context, message *Message, handler func(context.Context, *Message) error, fail func(error)) {
+	var stopRenew func()
 	if r.cfg.autoRenew {
 		renewCtx, cancelRenew := context.WithCancel(ctx)
-		defer cancelRenew()
-		go r.renewLoop(renewCtx, message, fail)
+		renewDone := make(chan struct{})
+		go func() {
+			defer close(renewDone)
+			r.renewLoop(renewCtx, message, fail)
+		}()
+		stopRenew = func() {
+			cancelRenew()
+			<-renewDone
+		}
 	}
 
 	handlerErr := handler(ctx, message)
+	if stopRenew != nil {
+		// A lock token must never be renewed concurrently with its terminal
+		// settlement. Stop and join the renew loop before Complete or Abandon.
+		stopRenew()
+	}
 	settleCtx, cancelSettle := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSettle()
 	if handlerErr != nil {
