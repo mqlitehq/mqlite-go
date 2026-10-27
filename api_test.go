@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +121,143 @@ func TestSettlementFalseMeansLockLost(t *testing.T) {
 	message := client.Message("jobs", 7, "stale-lock")
 	if err := message.Renew(context.Background()); !errors.Is(err, ErrLockLost) {
 		t.Fatalf("error = %v, want ErrLockLost", err)
+	}
+}
+
+func TestBatchSettlementWireContract(t *testing.T) {
+	var requestErr error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request wire.CompleteBatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			requestErr = err
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.URL.Path != wire.PathCompleteBatch || request.Queue != "jobs" || len(request.Messages) != 2 ||
+			request.Messages[0].SeqNumber != 7 || request.Messages[0].LockToken != "lock-7" ||
+			request.Messages[1].SeqNumber != 8 || request.Messages[1].LockToken != "lock-8" {
+			requestErr = fmt.Errorf("unexpected batch request: path=%q body=%+v", r.URL.Path, request)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(wire.CompleteBatchResponse{Results: []wire.SettleItemResult{
+			{SeqNumber: 7, Ok: true},
+			{SeqNumber: 8, Ok: false},
+		}})
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := client.CompleteBatch(context.Background(), "jobs",
+		client.Message("jobs", 7, "lock-7"), client.Message("jobs", 8, "lock-8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if len(results) != 2 || !results[0].Ok || results[1].Ok {
+		t.Fatalf("results = %+v", results)
+	}
+}
+
+func TestBatchSettlementRejectsNilWithoutRequest(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.CompleteBatch(context.Background(), "jobs", (*Message)(nil)); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("CompleteBatch error = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := client.RenewBatch(context.Background(), "jobs", (*Message)(nil)); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("RenewBatch error = %v, want ErrInvalidArgument", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("requests = %d, want 0", got)
+	}
+}
+
+func TestRenewBatchWireContract(t *testing.T) {
+	const deadline = int64(1700000000000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wire.PathRenewBatch {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var request wire.RenewBatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Queue != "jobs" || len(request.Messages) != 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{
+			{SeqNumber: 7, Ok: true, LockedUntilMs: deadline},
+			{SeqNumber: 8, Ok: false},
+		}})
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := client.RenewBatch(context.Background(), "jobs",
+		client.Message("jobs", 7, "lock-7"), client.Message("jobs", 8, "lock-8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || !results[0].Ok || results[0].LockedUntil.UnixNano()/int64(time.Millisecond) != deadline || results[1].Ok || !results[1].LockedUntil.IsZero() {
+		t.Fatalf("results = %+v", results)
+	}
+}
+
+func TestBatchSettlementRejectsMalformedSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+		want error
+	}{
+		{name: "complete truncated", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true}]}`, want: ErrOutcomeUnknown},
+		{name: "complete reordered", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":8,"ok":true},{"seq_number":7,"ok":true}]}`, want: ErrOutcomeUnknown},
+		{name: "renew missing deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true},{"seq_number":8,"ok":false}]}`},
+		{name: "renew stale with deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":false,"locked_until_ms":1700000000001}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != test.path {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages := []*Message{client.Message("jobs", 7, "lock-7"), client.Message("jobs", 8, "lock-8")}
+			if test.path == wire.PathCompleteBatch {
+				_, err = client.CompleteBatch(context.Background(), "jobs", messages...)
+			} else {
+				_, err = client.RenewBatch(context.Background(), "jobs", messages...)
+			}
+			if err == nil {
+				t.Fatal("malformed success was accepted")
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want errors.Is(_, %v)", err, test.want)
+			}
+		})
 	}
 }
 

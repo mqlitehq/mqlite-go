@@ -28,6 +28,7 @@ func TestParseDSNContract(t *testing.T) {
 		{name: "secure product scheme", dsn: "mqlites://broker", wantEndpoint: "https://broker:6754"},
 		{name: "explicit port", dsn: "mqlite://broker:9000", wantEndpoint: "http://broker:9000"},
 		{name: "embedded token", dsn: "mqlite://secret@broker", wantEndpoint: "http://broker:6754", wantToken: "secret"},
+		{name: "escaped colon in token", dsn: "mqlite://tok%3Aen@broker", wantEndpoint: "http://broker:6754", wantToken: "tok:en"},
 		{name: "tls query compatibility", dsn: "mqlite://broker?tls=true", wantEndpoint: "https://broker:6754"},
 		{name: "explicit plaintext query", dsn: "mqlite://broker?tls=false", wantEndpoint: "http://broker:6754"},
 		{name: "secure scheme cannot be downgraded", dsn: "mqlites://broker?tls=false", wantEndpoint: "https://broker:6754"},
@@ -39,9 +40,14 @@ func TestParseDSNContract(t *testing.T) {
 		{name: "unknown product query", dsn: "mqlite://broker?region=us", wantErr: true},
 		{name: "duplicate tls query", dsn: "mqlite://broker?tls=true&tls=false", wantErr: true},
 		{name: "invalid tls query", dsn: "mqlite://broker?tls=1", wantErr: true},
+		{name: "malformed product query", dsn: "mqlite://broker?tls=true&bad=%ZZ", wantErr: true},
+		{name: "empty product query", dsn: "mqlite://broker?", wantErr: true},
 		{name: "product path", dsn: "mqlite://broker/base", wantErr: true},
+		{name: "product password component", dsn: "mqlite://token:password@broker", wantErr: true},
+		{name: "malformed product token", dsn: "mqlite://token%ZZ@broker", wantErr: true},
 		{name: "http credentials", dsn: "http://token@broker", wantErr: true},
 		{name: "http query", dsn: "http://broker?token=secret", wantErr: true},
+		{name: "empty http query", dsn: "http://broker?", wantErr: true},
 		{name: "fragment", dsn: "https://broker/#fragment", wantErr: true},
 	}
 
@@ -61,6 +67,37 @@ func TestParseDSNContract(t *testing.T) {
 				t.Errorf("token = %q, want %q", token, test.wantToken)
 			}
 		})
+	}
+}
+
+func TestConnectionStringErrorsDoNotExposeCredentials(t *testing.T) {
+	const marker = "credential-marker-7462"
+	dsns := []string{
+		"mqlite://" + marker + "%ZZ@broker",
+		"mqlite://" + marker + ":password@broker",
+		"mqlite://" + marker + "@broker/path",
+		"mqlite://" + marker + "@broker?tls=true&bad=%ZZ",
+	}
+	for _, dsn := range dsns {
+		checks := []struct {
+			name string
+			call func() error
+		}{
+			{name: "parse", call: func() error { _, _, err := parseDSN(dsn); return err }},
+			{name: "open", call: func() error { _, err := Open(context.Background(), dsn); return err }},
+			{name: "identity", call: func() error { _, err := EndpointIdentity(dsn); return err }},
+		}
+		for _, check := range checks {
+			t.Run(check.name, func(t *testing.T) {
+				err := check.call()
+				if err == nil {
+					t.Fatal("invalid credential-bearing connection string was accepted")
+				}
+				if strings.Contains(err.Error(), marker) {
+					t.Fatal("connection string error exposed credential material")
+				}
+			})
+		}
 	}
 }
 
@@ -84,6 +121,11 @@ func TestOpenTokenOverrideAndSendWireContract(t *testing.T) {
 		}
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			requestErr = fmt.Errorf("Content-Type = %q", got)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			requestErr = fmt.Errorf("Accept = %q", got)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
