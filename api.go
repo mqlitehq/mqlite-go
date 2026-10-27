@@ -355,8 +355,9 @@ func (c *Client) DeleteQueueWithOptions(ctx context.Context, name string, opts .
 	return DeleteResult{Deleted: response.Deleted, State: response.State}, nil
 }
 
-// Subscribe creates or updates a permanent topic subscription. Receive from the
-// subscription name, not the topic name.
+// Subscribe creates a topic subscription without a fixed TTL, or updates an
+// existing subscription without changing its original lifetime. Receive from
+// the subscription name, not the topic name.
 func (c *Client) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
 	return c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{
 		Topic: topic, Name: name, Filter: filterToWire(filter),

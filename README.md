@@ -197,11 +197,12 @@ already have committed.
 
 `Receiver.Run` always uses Peek-Lock; a process crash or lost Complete response
 can cause redelivery rather than silent removal. Explicit
-`Receive(..., RecvOpts{AtMostOnce: true})`, message or subscription TTL expiry,
-force deletion, purge, cancel, and configured DLQ retention are deliberate data
-removal boundaries. A send transport failure can be ambiguous, so producers
-that cannot recreate work should use an application outbox and stable message
-identity; consumers must still be idempotent.
+`Receive(..., RecvOpts{AtMostOnce: true})`, subscription TTL expiry, force
+deletion, purge, cancel, and configured DLQ retention are deliberate data
+removal boundaries. Message TTL expiry enters the DLQ by default and discards
+only when the queue disables dead-letter-on-expire. A send transport failure can
+be ambiguous, so producers that cannot recreate work should use an application
+outbox and stable message identity; consumers must still be idempotent.
 
 All SDK times cross the wire as UTC epoch milliseconds. Resource names are the
 public identity; callers must serialize same-name deletion and recreation.

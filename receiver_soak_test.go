@@ -3,6 +3,7 @@ package mqlite
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ type sustainedReceiveSource struct {
 	mu     sync.Mutex
 	next   int64
 	total  int64
+	queue  string
 	cancel context.CancelFunc
 
 	completed  []uint32
@@ -43,23 +45,27 @@ func (s *sustainedReceiveSource) receiveOne(ctx context.Context, queue string, m
 	s.next += count
 	s.mu.Unlock()
 
+	if queue != s.queue {
+		atomic.AddInt64(&s.unexpected, 1)
+	}
 	deadline := time.Now().Add(time.Hour)
 	messages := make([]*Message, count)
 	for i := range messages {
+		sequence := start + int64(i)
 		messages[i] = &Message{
-			SequenceNumber: start + int64(i),
+			SequenceNumber: sequence,
 			Body:           []byte("sentinel"),
 			LockedUntil:    deadline,
 			queue:          queue,
-			lockToken:      "soak-token",
+			lockToken:      "soak-" + strconv.FormatInt(sequence, 10),
 			s:              s,
 		}
 	}
 	return messages, nil
 }
 
-func (s *sustainedReceiveSource) complete(_ context.Context, _ string, seq int64, _ string) error {
-	if seq <= 0 || seq > s.total {
+func (s *sustainedReceiveSource) complete(_ context.Context, queue string, seq int64, token string) error {
+	if seq <= 0 || seq > s.total || queue != s.queue || token != "soak-"+strconv.FormatInt(seq, 10) {
 		atomic.AddInt64(&s.unexpected, 1)
 	} else {
 		atomic.AddUint32(&s.completed[seq], 1)
@@ -95,15 +101,17 @@ func (s *sustainedReceiveSource) renew(context.Context, string, int64, string) e
 // workers, crossed settlement identities, or missing terminal joins without
 // relying on unstable process-RSS thresholds.
 func TestReceiverSustainedLifecycle(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	source := &sustainedReceiveSource{
 		total:     sustainedReceiverMessages,
+		queue:     "sentinel-subscription",
 		cancel:    cancel,
 		completed: make([]uint32, sustainedReceiverMessages+1),
 	}
 	handled := make([]uint32, sustainedReceiverMessages+1)
-	receiver := newReceiver(source, "sentinel-subscription", []ReceiverOption{
+	var handledCount int64
+	receiver := newReceiver(source, source.queue, []ReceiverOption{
 		WithConcurrency(32),
 		WithPrefetch(32),
 		WithAutoRenew(),
@@ -115,8 +123,13 @@ func TestReceiverSustainedLifecycle(t *testing.T) {
 			return nil
 		}
 		atomic.AddUint32(&handled[message.SequenceNumber], 1)
+		atomic.AddInt64(&handledCount, 1)
 		return nil
 	})
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("receiver soak timed out: handled=%d completed=%d want=%d",
+			atomic.LoadInt64(&handledCount), atomic.LoadInt64(&source.settled), sustainedReceiverMessages)
+	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error = %v, want context.Canceled", err)
 	}
