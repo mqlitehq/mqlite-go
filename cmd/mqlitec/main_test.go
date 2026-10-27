@@ -42,7 +42,7 @@ func TestVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output != "mqlitec 0.1.0\n" {
+	if output != "mqlitec 0.1.1\n" {
 		t.Fatalf("output = %q", output)
 	}
 }

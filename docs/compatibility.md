@@ -2,10 +2,10 @@
 
 ## Two Go modules, two use cases
 
-| Module | Go floor | Runtime dependencies | Embedded SQLite | Remote broker |
-|---|---:|---|---:|---:|
-| `github.com/mqlitehq/mqlite-go` | 1.13 | standard library only | no | yes |
-| `github.com/mqlitehq/mqlite` | 1.21 | engine and storage stack | yes | yes |
+| Distribution | Module | Go floor | Runtime dependencies | Embedded SQLite | Remote broker |
+|---|---|---:|---|---:|---:|
+| MQLite Remote Client for Go | `github.com/mqlitehq/mqlite-go` | 1.13 | standard library only | no | yes |
+| MQLite full Go module | `github.com/mqlitehq/mqlite` | 1.21 | engine and storage stack | yes | yes |
 
 The low floor applies to source and module compatibility. Go 1.13 no longer
 receives security fixes, and consumers should compile production programs with a
@@ -18,7 +18,7 @@ Apple Silicon release artifacts.
 
 ## Broker compatibility
 
-The v0.1.0 SDK is blackbox-tested against the exact
+The v0.1.1 client is blackbox-tested against the exact
 `ghcr.io/mqlitehq/mqlite:0.4.1` broker image. Core queue calls use the stable
 JSON-over-HTTP routes shared by MQLite clients. Lifecycle-aware queue/subscription
 deletion, fixed subscription TTL, and paged subscription inventory require a

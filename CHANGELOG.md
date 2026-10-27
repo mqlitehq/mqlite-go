@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.1 — 2026-10-28
+
+- Present the package as MQLite Remote Client for Go while preserving its
+  repository, module, import, package, and CLI names.
+- Derive managed auto-renew cadence from half the initially observed remaining
+  lease, including sub-two-second leases; retry one transient renewal and stop
+  the renewal loop before terminal settlement.
+- Sanitize malformed connection-string errors, reject ambiguous userinfo and
+  query forms, and request JSON explicitly from HTTP endpoints.
+- Reject nil batch inputs and incomplete, reordered, or internally inconsistent
+  batch settlement acknowledgements instead of panicking or accepting malformed
+  success responses.
+- Compare linked size with an equivalent handwritten HTTP/JSON Status client so
+  the Go network stack is not misreported as SDK-specific overhead.
+
 ## v0.1.0 — 2026-10-27
 
 - Add the standard-library-only remote MQLite SDK with a Go 1.13 source floor.

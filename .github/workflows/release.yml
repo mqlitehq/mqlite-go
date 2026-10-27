@@ -71,7 +71,7 @@ jobs:
           set -eu
           version=${GITHUB_REF_NAME#v}
           {
-            printf '# mqlite-go %s\n\n' "$version"
+            printf '# MQLite Remote Client for Go %s\n\n' "$version"
             awk -v version="$version" '
               $0 ~ "^## v" version "([[:space:]]|$)" { found=1; next }
               found && /^## / { exit }
