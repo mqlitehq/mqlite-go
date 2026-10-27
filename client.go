@@ -15,6 +15,27 @@ import (
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
 
+type invalidSuccessResponseError struct{ cause error }
+
+func (e *invalidSuccessResponseError) Error() string {
+	return "mqlite: invalid successful response: " + e.cause.Error()
+}
+
+func (e *invalidSuccessResponseError) Unwrap() error { return e.cause }
+
+type ambiguousOutcomeError struct {
+	operation string
+	cause     error
+}
+
+func (e *ambiguousOutcomeError) Error() string {
+	return fmt.Sprintf("%s: invalid %s acknowledgement: %v", ErrOutcomeUnknown, e.operation, e.cause)
+}
+
+func (e *ambiguousOutcomeError) Unwrap() error { return e.cause }
+
+func (e *ambiguousOutcomeError) Is(target error) bool { return target == ErrOutcomeUnknown }
+
 const (
 	defaultBrokerPort = "6754"
 	// The broker caps the sum of raw message bodies at 32 MiB. JSON base64
@@ -257,14 +278,14 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		if isLifecycleDelete(path) {
 			return fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, reconcileHint(path))
 		}
-		return err
+		return &invalidSuccessResponseError{cause: err}
 	}
 	if raw, ok := out.(*json.RawMessage); ok {
 		*raw = append((*raw)[:0], data...)
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("mqlite: invalid response: %w", err)
+		return &invalidSuccessResponseError{cause: err}
 	}
 	return nil
 }

@@ -228,6 +228,8 @@ func TestBatchSettlementRejectsMalformedSuccess(t *testing.T) {
 	}{
 		{name: "complete truncated", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true}]}`, want: ErrOutcomeUnknown},
 		{name: "complete reordered", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":8,"ok":true},{"seq_number":7,"ok":true}]}`, want: ErrOutcomeUnknown},
+		{name: "complete with renewal deadline", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":true}]}`, want: ErrOutcomeUnknown},
+		{name: "complete truncated JSON", path: wire.PathCompleteBatch, body: `{"results":[`, want: ErrOutcomeUnknown},
 		{name: "renew missing deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true},{"seq_number":8,"ok":false}]}`},
 		{name: "renew stale with deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":false,"locked_until_ms":1700000000001}]}`},
 	}
@@ -257,7 +259,32 @@ func TestBatchSettlementRejectsMalformedSuccess(t *testing.T) {
 			if test.want != nil && !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want errors.Is(_, %v)", err, test.want)
 			}
+			if test.name == "complete truncated JSON" {
+				var syntax *json.SyntaxError
+				if !errors.As(err, &syntax) {
+					t.Fatalf("error = %v, want preserved JSON syntax cause", err)
+				}
+			}
 		})
+	}
+}
+
+func TestCompleteBatchHTTPRejectionIsNotOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"code":"permission_denied","message":"not allowed"}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CompleteBatch(context.Background(), "jobs", client.Message("jobs", 7, "lock-7"))
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("error = %v, want ErrPermissionDenied", err)
+	}
+	if errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("HTTP rejection was misclassified as ErrOutcomeUnknown: %v", err)
 	}
 }
 

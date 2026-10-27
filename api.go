@@ -3,6 +3,7 @@ package mqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -171,6 +172,7 @@ func validateBatchResults(messages []*Message, results []wire.SettleItemResult, 
 	}
 	for i, result := range results {
 		if result.SeqNumber != messages[i].SequenceNumber || result.LockedUntilMs < 0 ||
+			(!renew && result.LockedUntilMs != 0) ||
 			(renew && ((result.Ok && result.LockedUntilMs == 0) || (!result.Ok && result.LockedUntilMs != 0))) {
 			return fmt.Errorf("mqlite: invalid batch result at index %d", i)
 		}
@@ -191,10 +193,14 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, messages ...*M
 	}
 	response := wire.CompleteBatchResponse{}
 	if err := c.post(ctx, wire.PathCompleteBatch, wire.CompleteBatchRequest{Queue: queue, Messages: items}, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, &ambiguousOutcomeError{operation: "CompleteBatch", cause: err}
+		}
 		return nil, err
 	}
 	if err := validateBatchResults(messages, response.Results, false); err != nil {
-		return nil, fmt.Errorf("%w: invalid CompleteBatch acknowledgement: %v", ErrOutcomeUnknown, err)
+		return nil, &ambiguousOutcomeError{operation: "CompleteBatch", cause: err}
 	}
 	return settleResults(response.Results), nil
 }
