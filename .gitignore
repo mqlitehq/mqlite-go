@@ -1,0 +1,7 @@
+/coverage.out
+/dist/
+/stage/
+/size.tsv
+/release-notes.md
+*.test
+.DS_Store
