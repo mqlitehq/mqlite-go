@@ -52,7 +52,9 @@ func filterToWire(filter *Filter) *wire.Filter {
 	return &wire.Filter{Expr: filter.Expr}
 }
 
-// SendOne sends or schedules one message and returns its sequence number.
+// SendOne sends or schedules one message and returns its sequence number. When
+// queue names a topic, only active matching subscriptions retain a copy; a
+// successful publish with no match returns sequence zero and stores no history.
 func (c *Client) SendOne(ctx context.Context, queue string, message OutMessage, opts ...SendOpts) (int64, error) {
 	if err := validateOutMessageTTL(message); err != nil {
 		return 0, err
@@ -353,7 +355,8 @@ func (c *Client) DeleteQueueWithOptions(ctx context.Context, name string, opts .
 	return DeleteResult{Deleted: response.Deleted, State: response.State}, nil
 }
 
-// Subscribe creates or updates a topic subscription.
+// Subscribe creates or updates a permanent topic subscription. Receive from the
+// subscription name, not the topic name.
 func (c *Client) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
 	return c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{
 		Topic: topic, Name: name, Filter: filterToWire(filter),
@@ -528,7 +531,8 @@ func (c *Client) TestFilter(ctx context.Context, expression string, sample *OutM
 	}, nil
 }
 
-// Receiver returns a managed receive loop bound to queue.
+// Receiver returns a managed receive loop bound to queue. To consume a topic,
+// bind it to the subscription name rather than the topic name.
 func (c *Client) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 	return newReceiver(c, queue, opts)
 }
