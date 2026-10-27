@@ -1,13 +1,14 @@
-# mqlite-go
+# MQLite Remote Client for Go
 
 [![CI](https://github.com/mqlitehq/mqlite-go/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite-go/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite-go.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite-go)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`mqlite-go` is the dependency-free, remote-only Go SDK for an
-[MQLite](https://github.com/mqlitehq/mqlite) broker. It keeps a Go 1.13 source
-floor for older applications without pulling the embedded SQLite engine,
-libSQL/Turso drivers, CGO, or any third-party runtime module into their builds.
+MQLite Remote Client for Go (`mqlite-go`) is the official, dependency-free,
+remote-only Go client for an [MQLite](https://github.com/mqlitehq/mqlite) broker.
+It keeps a Go 1.13 source floor for older applications without pulling the
+embedded SQLite engine, libSQL/Turso drivers, CGO, or any third-party runtime
+module into their builds.
 
 Use the main `github.com/mqlitehq/mqlite` module when you need an embedded queue,
 same-database transactions, or the combined local/remote API. Use this module
@@ -16,7 +17,7 @@ when the application only talks to a broker over HTTP and a low Go floor matters
 ## Install
 
 ```sh
-go get github.com/mqlitehq/mqlite-go@v0.1.0
+go get github.com/mqlitehq/mqlite-go@v0.1.1
 ```
 
 The module declares `go 1.13` and is tested with Go 1.13.15, Go 1.18.10, and
@@ -78,7 +79,10 @@ func process(body []byte) error { return nil }
 
 `Client.Receiver` provides a managed consume loop with bounded concurrency,
 idempotent receive retries, optional lock renewal, and automatic Complete or
-Abandon based on the handler result.
+Abandon based on the handler result. Auto-renew schedules from the delivery's
+remaining lease and safely retries one transient renewal; the configured lock
+duration must still leave enough time for the network round trip, and the
+application and broker clocks should be synchronized.
 
 ## Topics and temporary subscriptions
 
@@ -137,6 +141,9 @@ settlement, and a receive retry reuses the same attempt ID so a lost response
 does not claim another batch. Destructive queue/subscription deletion is sent at
 most once: redirects, transport failures, and gateway 5xx responses return
 `ErrOutcomeUnknown` for read-only reconciliation rather than automatic replay.
+`CompleteBatch` also reports `ErrOutcomeUnknown` when a successful HTTP response
+does not acknowledge the requested messages coherently; some completions may
+already have committed.
 
 All SDK times cross the wire as UTC epoch milliseconds. Resource names are the
 public identity; callers must serialize same-name deletion and recreation.

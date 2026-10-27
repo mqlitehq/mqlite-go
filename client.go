@@ -15,6 +15,27 @@ import (
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
 
+type invalidSuccessResponseError struct{ cause error }
+
+func (e *invalidSuccessResponseError) Error() string {
+	return "mqlite: invalid successful response: " + e.cause.Error()
+}
+
+func (e *invalidSuccessResponseError) Unwrap() error { return e.cause }
+
+type ambiguousOutcomeError struct {
+	operation string
+	cause     error
+}
+
+func (e *ambiguousOutcomeError) Error() string {
+	return fmt.Sprintf("%s: invalid %s acknowledgement: %v", ErrOutcomeUnknown, e.operation, e.cause)
+}
+
+func (e *ambiguousOutcomeError) Unwrap() error { return e.cause }
+
+func (e *ambiguousOutcomeError) Is(target error) bool { return target == ErrOutcomeUnknown }
+
 const (
 	defaultBrokerPort = "6754"
 	// The broker caps the sum of raw message bodies at 32 MiB. JSON base64
@@ -100,7 +121,7 @@ func parseDSN(dsn string) (string, string, error) {
 		if u.User != nil {
 			return "", "", fmt.Errorf("mqlite: HTTP endpoint must not contain credentials; use WithToken")
 		}
-		if u.RawQuery != "" || u.Fragment != "" {
+		if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 			return "", "", fmt.Errorf("mqlite: endpoint must not contain a query or fragment")
 		}
 		return strings.TrimRight(dsn, "/"), "", nil
@@ -108,7 +129,9 @@ func parseDSN(dsn string) (string, string, error) {
 
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return "", "", fmt.Errorf("mqlite: bad connection string: %w", err)
+		// url.Error includes the original URL. A custom DSN may contain a
+		// bearer token in userinfo, so never return the parser's text.
+		return "", "", fmt.Errorf("mqlite: bad connection string")
 	}
 	if u.Scheme != "mqlite" && u.Scheme != "mqlites" {
 		return "", "", fmt.Errorf("mqlite: unsupported scheme %q", u.Scheme)
@@ -119,8 +142,11 @@ func parseDSN(dsn string) (string, string, error) {
 	if u.Path != "" || u.Fragment != "" {
 		return "", "", fmt.Errorf("mqlite: custom connection string must contain only credentials and host")
 	}
-	query := u.Query()
-	if u.RawQuery != "" && len(query) == 0 {
+	if u.ForceQuery {
+		return "", "", fmt.Errorf("mqlite: invalid custom connection string query")
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
 		return "", "", fmt.Errorf("mqlite: invalid custom connection string query")
 	}
 	if len(query) > 1 || (len(query) == 1 && len(query["tls"]) != 1) {
@@ -135,6 +161,9 @@ func parseDSN(dsn string) (string, string, error) {
 	}
 	token := ""
 	if u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			return "", "", fmt.Errorf("mqlite: custom connection string token must not use a password component")
+		}
 		token = u.User.Username()
 	}
 	scheme := "http"
@@ -180,6 +209,7 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
@@ -248,14 +278,14 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		if isLifecycleDelete(path) {
 			return fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, reconcileHint(path))
 		}
-		return err
+		return &invalidSuccessResponseError{cause: err}
 	}
 	if raw, ok := out.(*json.RawMessage); ok {
 		*raw = append((*raw)[:0], data...)
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("mqlite: invalid response: %w", err)
+		return &invalidSuccessResponseError{cause: err}
 	}
 	return nil
 }

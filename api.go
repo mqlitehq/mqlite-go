@@ -3,6 +3,7 @@ package mqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -154,6 +155,31 @@ func settleResults(results []wire.SettleItemResult) []SettleResult {
 	return out
 }
 
+func settleItems(messages []*Message) ([]wire.SettleItem, error) {
+	items := make([]wire.SettleItem, len(messages))
+	for i, message := range messages {
+		if message == nil {
+			return nil, fmt.Errorf("%w: message %d is nil", ErrInvalidArgument, i)
+		}
+		items[i] = wire.SettleItem{SeqNumber: message.SequenceNumber, LockToken: message.lockToken}
+	}
+	return items, nil
+}
+
+func validateBatchResults(messages []*Message, results []wire.SettleItemResult, renew bool) error {
+	if len(results) != len(messages) {
+		return fmt.Errorf("mqlite: batch response has %d results for %d messages", len(results), len(messages))
+	}
+	for i, result := range results {
+		if result.SeqNumber != messages[i].SequenceNumber || result.LockedUntilMs < 0 ||
+			(!renew && result.LockedUntilMs != 0) ||
+			(renew && ((result.Ok && result.LockedUntilMs == 0) || (!result.Ok && result.LockedUntilMs != 0))) {
+			return fmt.Errorf("mqlite: invalid batch result at index %d", i)
+		}
+	}
+	return nil
+}
+
 // Message creates a settleable handle for a previously received message.
 func (c *Client) Message(queue string, sequenceNumber int64, lockToken string) *Message {
 	return &Message{queue: queue, SequenceNumber: sequenceNumber, lockToken: lockToken, s: c}
@@ -161,13 +187,20 @@ func (c *Client) Message(queue string, sequenceNumber int64, lockToken string) *
 
 // CompleteBatch completes many messages in one round trip.
 func (c *Client) CompleteBatch(ctx context.Context, queue string, messages ...*Message) ([]SettleResult, error) {
-	items := make([]wire.SettleItem, len(messages))
-	for i, message := range messages {
-		items[i] = wire.SettleItem{SeqNumber: message.SequenceNumber, LockToken: message.lockToken}
+	items, err := settleItems(messages)
+	if err != nil {
+		return nil, err
 	}
 	response := wire.CompleteBatchResponse{}
 	if err := c.post(ctx, wire.PathCompleteBatch, wire.CompleteBatchRequest{Queue: queue, Messages: items}, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, &ambiguousOutcomeError{operation: "CompleteBatch", cause: err}
+		}
 		return nil, err
+	}
+	if err := validateBatchResults(messages, response.Results, false); err != nil {
+		return nil, &ambiguousOutcomeError{operation: "CompleteBatch", cause: err}
 	}
 	return settleResults(response.Results), nil
 }
@@ -177,13 +210,16 @@ func (c *Client) RenewBatch(ctx context.Context, queue string, messages ...*Mess
 	if len(messages) > MaxRenewBatch {
 		return nil, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)
 	}
-	items := make([]wire.SettleItem, len(messages))
-	for i, message := range messages {
-		items[i] = wire.SettleItem{SeqNumber: message.SequenceNumber, LockToken: message.lockToken}
+	items, err := settleItems(messages)
+	if err != nil {
+		return nil, err
 	}
 	response := wire.RenewBatchResponse{}
 	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &response); err != nil {
 		return nil, err
+	}
+	if err := validateBatchResults(messages, response.Results, true); err != nil {
+		return nil, fmt.Errorf("mqlite: invalid RenewBatch response: %w", err)
 	}
 	return settleResults(response.Results), nil
 }

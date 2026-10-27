@@ -28,12 +28,14 @@ type settleRecord struct {
 }
 
 type fakeReceiveSource struct {
-	mu        sync.Mutex
-	receives  []receiveRecord
-	settles   []settleRecord
-	receiveFn func(context.Context, int, receiveRecord) ([]*Message, error)
-	settleErr error
-	renewed   chan struct{}
+	mu         sync.Mutex
+	receives   []receiveRecord
+	settles    []settleRecord
+	receiveFn  func(context.Context, int, receiveRecord) ([]*Message, error)
+	settleErr  error
+	renewFn    func(int) error
+	renewCalls int
+	renewed    chan struct{}
 }
 
 func (s *fakeReceiveSource) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode receiveMode, attemptID string) ([]*Message, error) {
@@ -55,12 +57,22 @@ func (s *fakeReceiveSource) recordSettle(record settleRecord) error {
 	s.settles = append(s.settles, record)
 	err := s.settleErr
 	renewed := s.renewed
+	var renewFn func(int) error
+	var renewCall int
+	if record.op == "renew" {
+		s.renewCalls++
+		renewCall = s.renewCalls
+		renewFn = s.renewFn
+	}
 	s.mu.Unlock()
 	if record.op == "renew" && renewed != nil {
 		select {
 		case renewed <- struct{}{}:
 		default:
 		}
+	}
+	if renewFn != nil {
+		return renewFn(renewCall)
 	}
 	return err
 }
@@ -82,6 +94,9 @@ func (s *fakeReceiveSource) deferMsg(ctx context.Context, queue string, seq int6
 }
 
 func (s *fakeReceiveSource) renew(ctx context.Context, queue string, seq int64, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.recordSettle(settleRecord{op: "renew", queue: queue, seq: seq, token: token})
 }
 
@@ -319,7 +334,6 @@ func TestReceiverAutoRenewsAndAbandonsHandlerFailure(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew()})
-	receiver.renewFloor = 2 * time.Millisecond
 	err := receiver.Run(ctx, func(context.Context, *Message) error {
 		select {
 		case <-source.renewed:
@@ -345,6 +359,141 @@ func TestReceiverAutoRenewsAndAbandonsHandlerFailure(t *testing.T) {
 		}
 	}
 	if renews == 0 || abandons != 1 || completes != 0 {
+		t.Fatalf("settlements = %+v", settles)
+	}
+	if settles[len(settles)-1].op != "abandon" {
+		t.Fatalf("renewal overlapped terminal settlement: %+v", settles)
+	}
+}
+
+func TestAutoRenewIntervalStaysInsideShortLease(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+	}{
+		{name: "one second", remaining: time.Second, want: 500 * time.Millisecond},
+		{name: "twenty milliseconds", remaining: 20 * time.Millisecond, want: 10 * time.Millisecond},
+		{name: "long lease", remaining: time.Minute, want: 30 * time.Second},
+		{name: "smallest positive", remaining: time.Nanosecond, want: time.Nanosecond},
+		{name: "missing or expired", remaining: 0, want: 10 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := autoRenewInterval(test.remaining); got != test.want {
+				t.Fatalf("autoRenewInterval(%s) = %s, want %s", test.remaining, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRenewRetryClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "transport", err: errors.New("connection reset"), want: true},
+		{name: "ambiguous outcome", err: ErrOutcomeUnknown, want: true},
+		{name: "lock lost", err: ErrLockLost},
+		{name: "invalid argument", err: ErrInvalidArgument},
+		{name: "permission denied", err: ErrPermissionDenied},
+		{name: "unsupported", err: ErrUnsupported},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := retryableRenewError(test.err); got != test.want {
+				t.Fatalf("retryableRenewError(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestReceiverRetriesOneTransientRenewFailure(t *testing.T) {
+	secondRenew := make(chan struct{})
+	source := &fakeReceiveSource{}
+	source.renewFn = func(call int) error {
+		if call == 1 {
+			return errors.New("temporary renew failure")
+		}
+		if call == 2 {
+			close(secondRenew)
+		}
+		return nil
+	}
+	var returned int32
+	source.receiveFn = func(ctx context.Context, call int, record receiveRecord) ([]*Message, error) {
+		if atomic.CompareAndSwapInt32(&returned, 0, 1) {
+			message := source.message(10)
+			message.LockedUntil = time.Now().Add(20 * time.Millisecond)
+			return []*Message{message}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	var observed int32
+	ctx, cancel := context.WithCancel(context.Background())
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(error) { atomic.AddInt32(&observed, 1) }),
+	})
+	err := receiver.Run(ctx, func(context.Context, *Message) error {
+		select {
+		case <-secondRenew:
+		case <-time.After(time.Second):
+			t.Error("transient renewal was not retried")
+		}
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v", err)
+	}
+	settles := source.settleSnapshot()
+	var renews, completes int
+	for _, record := range settles {
+		switch record.op {
+		case "renew":
+			renews++
+		case "complete":
+			completes++
+		}
+	}
+	if renews < 2 || completes != 1 {
+		t.Fatalf("settlements = %+v", settles)
+	}
+	if settles[len(settles)-1].op != "complete" {
+		t.Fatalf("renewal overlapped terminal settlement: %+v", settles)
+	}
+	if got := atomic.LoadInt32(&observed); got != 1 {
+		t.Fatalf("error notifications = %d, want 1", got)
+	}
+}
+
+func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing.T) {
+	source := &fakeReceiveSource{}
+	source.renewFn = func(int) error { return ErrPermissionDenied }
+	var returned int32
+	source.receiveFn = func(ctx context.Context, call int, record receiveRecord) ([]*Message, error) {
+		if atomic.CompareAndSwapInt32(&returned, 0, 1) {
+			message := source.message(11)
+			message.LockedUntil = time.Now().Add(20 * time.Millisecond)
+			return []*Message{message}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew()})
+	err := receiver.Run(context.Background(), func(ctx context.Context, _ *Message) error {
+		<-ctx.Done()
+		return nil
+	})
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("Run error = %v, want ErrPermissionDenied", err)
+	}
+	settles := source.settleSnapshot()
+	if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
 		t.Fatalf("settlements = %+v", settles)
 	}
 }

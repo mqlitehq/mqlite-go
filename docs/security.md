@@ -12,6 +12,11 @@ the MQLite default port when omitted. The SDK never logs a token and does not pu
 one in returned errors. Prefer `WithToken` or `MQLITE_TOKEN`; a command-line token
 can leak through shell history and process inspection.
 
+Malformed connection strings are reported without returning the original DSN.
+The `mqlite://` and `mqlites://` forms accept a token as the username component
+but reject a separate password component, malformed query escaping, and an empty
+trailing query marker.
+
 Callers may pass a configured `*http.Client` with `WithHTTPClient` for custom
 roots, proxies, or transport controls. Do not set a short global timeout on that
 client: Receive uses request contexts for long polling. Set deadlines on each
@@ -41,7 +46,9 @@ advance authorization for automatic discard at a fixed deadline.
 The client bounds response bodies. Lifecycle deletion and subscription inventory
 also receive semantic validation: required fields, state combinations, page size,
 scope, ordering, cursor progress, and timestamp relationships must be coherent.
-Unknown fields remain forward compatible.
+Batch settlement responses must contain one ordered result per requested message;
+a successful renewal must also contain its committed deadline. Unknown fields
+remain forward compatible.
 
 ## Go floor
 

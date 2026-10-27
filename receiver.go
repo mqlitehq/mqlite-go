@@ -62,7 +62,6 @@ type Receiver struct {
 	cfg   receiverConfig
 
 	errMu            sync.Mutex
-	renewFloor       time.Duration
 	transientBackoff time.Duration
 }
 
@@ -80,7 +79,6 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 		src:              src,
 		queue:            queue,
 		cfg:              cfg,
-		renewFloor:       time.Second,
 		transientBackoff: 500 * time.Millisecond,
 	}
 }
@@ -223,13 +221,26 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 }
 
 func (r *Receiver) process(ctx context.Context, message *Message, handler func(context.Context, *Message) error, fail func(error)) {
+	var stopRenew func()
 	if r.cfg.autoRenew {
 		renewCtx, cancelRenew := context.WithCancel(ctx)
-		defer cancelRenew()
-		go r.renewLoop(renewCtx, message, fail)
+		renewDone := make(chan struct{})
+		go func() {
+			defer close(renewDone)
+			r.renewLoop(renewCtx, message, fail)
+		}()
+		stopRenew = func() {
+			cancelRenew()
+			<-renewDone
+		}
 	}
 
 	handlerErr := handler(ctx, message)
+	if stopRenew != nil {
+		// A lock token must never be renewed concurrently with its terminal
+		// settlement. Stop and join the renew loop before Complete or Abandon.
+		stopRenew()
+	}
 	settleCtx, cancelSettle := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSettle()
 	if handlerErr != nil {
@@ -249,14 +260,28 @@ func (r *Receiver) settleError(err error, fail func(error)) {
 	}
 }
 
+func autoRenewInterval(remaining time.Duration) time.Duration {
+	if remaining <= 0 {
+		// A missing deadline should not create a tight loop. The broker will
+		// either accept this conservative fallback renewal or return lock_lost.
+		return 10 * time.Second
+	}
+	interval := remaining / 2
+	if interval <= 0 {
+		return time.Nanosecond
+	}
+	return interval
+}
+
+func retryableRenewError(err error) bool {
+	return err != nil &&
+		!errors.Is(err, ErrLockLost) &&
+		!errors.Is(err, ErrInvalidArgument) &&
+		!permanentReceiverError(err)
+}
+
 func (r *Receiver) renewLoop(ctx context.Context, message *Message, fail func(error)) {
-	interval := 10 * time.Second
-	if remaining := time.Until(message.LockedUntil); remaining > 0 {
-		interval = remaining / 2
-	}
-	if interval < r.renewFloor {
-		interval = r.renewFloor
-	}
+	interval := autoRenewInterval(time.Until(message.LockedUntil))
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -265,7 +290,17 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, fail func(er
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := message.Renew(ctx); err != nil {
+			err := message.Renew(ctx)
+			if err != nil && ctx.Err() == nil && retryableRenewError(err) {
+				// Renew is fenced and only extends a deadline, so one replay is
+				// safe when the first response is lost or a transport fails. Retry
+				// before invoking user observation code so a slow callback cannot
+				// consume the remaining lease.
+				firstErr := err
+				err = message.Renew(ctx)
+				r.notify(firstErr)
+			}
+			if err != nil {
 				if ctx.Err() == nil {
 					r.settleError(err, fail)
 				}
