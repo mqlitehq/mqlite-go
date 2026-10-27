@@ -23,6 +23,9 @@ client: Receive uses request contexts for long polling. Set deadlines on each
 operation's context instead. A custom `RoundTripper` must not retry queue or
 subscription deletion: doing so would bypass the SDK's at-most-once deletion
 guard and could act on a later resource recreated under the same name.
+A custom transport must also honor `Request.Context()`. The managed receiver
+waits for an in-flight renewal to exit before terminal settlement; it cannot
+safely abandon that wait and race Complete or Abandon against the same token.
 
 ## Delivery and deletion
 

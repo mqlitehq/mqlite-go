@@ -38,6 +38,65 @@ type fakeReceiveSource struct {
 	renewed    chan struct{}
 }
 
+type blockingRenewSettler struct {
+	renewStarted     chan struct{}
+	renewCanceled    chan struct{}
+	allowRenewReturn chan struct{}
+	completeCalled   chan struct{}
+
+	mu         sync.Mutex
+	operations []string
+}
+
+func newBlockingRenewSettler() *blockingRenewSettler {
+	return &blockingRenewSettler{
+		renewStarted:     make(chan struct{}),
+		renewCanceled:    make(chan struct{}),
+		allowRenewReturn: make(chan struct{}),
+		completeCalled:   make(chan struct{}),
+	}
+}
+
+func (s *blockingRenewSettler) record(operation string) {
+	s.mu.Lock()
+	s.operations = append(s.operations, operation)
+	s.mu.Unlock()
+}
+
+func (s *blockingRenewSettler) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.operations...)
+}
+
+func (s *blockingRenewSettler) complete(context.Context, string, int64, string) error {
+	s.record("complete")
+	close(s.completeCalled)
+	return nil
+}
+
+func (s *blockingRenewSettler) abandon(context.Context, string, int64, string, int64) error {
+	s.record("abandon")
+	return nil
+}
+
+func (s *blockingRenewSettler) reject(context.Context, string, int64, string, string, string) error {
+	return nil
+}
+
+func (s *blockingRenewSettler) deferMsg(context.Context, string, int64, string) error {
+	return nil
+}
+
+func (s *blockingRenewSettler) renew(ctx context.Context, _ string, _ int64, _ string) error {
+	close(s.renewStarted)
+	<-ctx.Done()
+	close(s.renewCanceled)
+	<-s.allowRenewReturn
+	s.record("renew returned")
+	return ctx.Err()
+}
+
 func (s *fakeReceiveSource) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode receiveMode, attemptID string) ([]*Message, error) {
 	s.mu.Lock()
 	record := receiveRecord{max: max, waitMs: waitMs, mode: mode, attemptID: attemptID}
@@ -494,6 +553,85 @@ func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing
 	}
 	settles := source.settleSnapshot()
 	if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
+		t.Fatalf("settlements = %+v", settles)
+	}
+}
+
+func TestReceiverJoinsInFlightRenewBeforeComplete(t *testing.T) {
+	settler := newBlockingRenewSettler()
+	message := &Message{
+		SequenceNumber: 12,
+		LockedUntil:    time.Now().Add(20 * time.Millisecond),
+		queue:          "jobs",
+		lockToken:      "token-12",
+		s:              settler,
+	}
+	receiver := newReceiver(nil, "jobs", []ReceiverOption{WithAutoRenew()})
+	failures := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		receiver.process(context.Background(), message, func(context.Context, *Message) error {
+			<-settler.renewStarted
+			return nil
+		}, func(err error) {
+			failures <- err
+		})
+		close(done)
+	}()
+
+	select {
+	case <-settler.renewCanceled:
+	case <-time.After(time.Second):
+		close(settler.allowRenewReturn)
+		t.Fatal("in-flight renewal did not observe cancellation")
+	}
+
+	settledEarly := false
+	select {
+	case <-settler.completeCalled:
+		settledEarly = true
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(settler.allowRenewReturn)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("process did not return after renewal stopped")
+	}
+	select {
+	case err := <-failures:
+		t.Fatalf("unexpected receiver failure: %v", err)
+	default:
+	}
+	if settledEarly {
+		t.Fatal("Complete ran while Renew was still in flight")
+	}
+	operations := settler.snapshot()
+	if len(operations) != 2 || operations[0] != "renew returned" || operations[1] != "complete" {
+		t.Fatalf("operations = %v", operations)
+	}
+}
+
+func TestReceiverStopsIdleRenewLoopBeforeComplete(t *testing.T) {
+	source := &fakeReceiveSource{}
+	message := source.message(13)
+	message.LockedUntil = time.Now().Add(time.Hour)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew()})
+	failures := make(chan error, 1)
+	receiver.process(context.Background(), message, func(context.Context, *Message) error {
+		return nil
+	}, func(err error) {
+		failures <- err
+	})
+
+	select {
+	case err := <-failures:
+		t.Fatalf("unexpected receiver failure: %v", err)
+	default:
+	}
+	settles := source.settleSnapshot()
+	if len(settles) != 1 || settles[0].op != "complete" {
 		t.Fatalf("settlements = %+v", settles)
 	}
 }

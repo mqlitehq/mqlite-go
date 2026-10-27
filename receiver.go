@@ -126,7 +126,8 @@ func reserveWorkers(ctx context.Context, sem chan struct{}, max int) int {
 }
 
 // Run processes messages until ctx is canceled or a permanent broker error is
-// observed. It returns ctx.Err() for normal cancellation.
+// observed. It returns ctx.Err() for normal cancellation. Run waits for active
+// handlers and lock renewals to exit, so handlers must honor ctx and return.
 func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Message) error) error {
 	batch := r.cfg.prefetch
 	if batch <= 0 || batch > r.cfg.concurrency {
@@ -221,25 +222,25 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 }
 
 func (r *Receiver) process(ctx context.Context, message *Message, handler func(context.Context, *Message) error, fail func(error)) {
-	var stopRenew func()
+	var cancelRenew context.CancelFunc
+	var renewWG *sync.WaitGroup
 	if r.cfg.autoRenew {
-		renewCtx, cancelRenew := context.WithCancel(ctx)
-		renewDone := make(chan struct{})
+		renewCtx, cancel := context.WithCancel(ctx)
+		cancelRenew = cancel
+		renewWG = new(sync.WaitGroup)
+		renewWG.Add(1)
 		go func() {
-			defer close(renewDone)
+			defer renewWG.Done()
 			r.renewLoop(renewCtx, message, fail)
 		}()
-		stopRenew = func() {
-			cancelRenew()
-			<-renewDone
-		}
 	}
 
 	handlerErr := handler(ctx, message)
-	if stopRenew != nil {
+	if cancelRenew != nil {
 		// A lock token must never be renewed concurrently with its terminal
 		// settlement. Stop and join the renew loop before Complete or Abandon.
-		stopRenew()
+		cancelRenew()
+		renewWG.Wait()
 	}
 	settleCtx, cancelSettle := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSettle()
