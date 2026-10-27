@@ -65,7 +65,8 @@ func WithToken(token string) Option { return func(c *config) { c.token = token }
 
 // WithHTTPClient supplies a custom transport, proxy, or TLS configuration.
 // Do not set a global timeout shorter than the longest Receive wait.
-// The transport must not retry queue or subscription deletion requests.
+// The transport must honor request contexts and must not retry queue or
+// subscription deletion requests.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *config) { c.httpClient = client }
 }

@@ -82,7 +82,10 @@ idempotent receive retries, optional lock renewal, and automatic Complete or
 Abandon based on the handler result. Auto-renew schedules from the delivery's
 remaining lease and safely retries one transient renewal; the configured lock
 duration must still leave enough time for the network round trip, and the
-application and broker clocks should be synchronized.
+application and broker clocks should be synchronized. Shutdown is cooperative:
+handlers and custom HTTP transports must honor request contexts, and an error
+handler must return promptly. The receiver waits for an in-flight renewal to
+exit before it completes or abandons the same lock token.
 
 ## Topics and temporary subscriptions
 
