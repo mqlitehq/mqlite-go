@@ -14,6 +14,10 @@
   success responses.
 - Compare linked size with an equivalent handwritten HTTP/JSON Status client so
   the Go network stack is not misreported as SDK-specific overhead.
+- Document and continuously verify the supported long-lived topic-listener
+  pattern: a permanent subscription consumed by one managed `Receiver.Run`,
+  with explicit competing-consumer, fan-out, monitoring, and at-least-once
+  boundaries.
 
 ## v0.1.0 — 2026-10-27
 
