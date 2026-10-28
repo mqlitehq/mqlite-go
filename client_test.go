@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -326,6 +327,137 @@ func TestOpenBuildsOwnedPooledTransport(t *testing.T) {
 	}
 	if transport.MaxIdleConnsPerHost < 64 {
 		t.Fatalf("MaxIdleConnsPerHost = %d, want at least 64", transport.MaxIdleConnsPerHost)
+	}
+}
+
+func TestOwnedTransportReusesConcurrentConnections(t *testing.T) {
+	const parallel = 8
+
+	firstArrived := make(chan struct{})
+	secondArrived := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	var firstReleaseOnce sync.Once
+	var secondReleaseOnce sync.Once
+	releaseFirst := func() { firstReleaseOnce.Do(func() { close(firstRelease) }) }
+	releaseSecond := func() { secondReleaseOnce.Do(func() { close(secondRelease) }) }
+	defer releaseFirst()
+	defer releaseSecond()
+
+	var requests int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt32(&requests, 1)
+		switch {
+		case call <= parallel:
+			if call == parallel {
+				close(firstArrived)
+			}
+			<-firstRelease
+		case call <= 2*parallel:
+			if call == 2*parallel {
+				close(secondArrived)
+			}
+			<-secondRelease
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, `{"seq_numbers":[1]}`)
+	}))
+
+	var stateMu sync.Mutex
+	states := make(map[net.Conn]http.ConnState)
+	accepted := 0
+	stateChanged := make(chan struct{}, 1)
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		stateMu.Lock()
+		if state == http.StateNew {
+			accepted++
+		}
+		states[conn] = state
+		stateMu.Unlock()
+		select {
+		case stateChanged <- struct{}{}:
+		default:
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	snapshot := func() (int, int) {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		idle := 0
+		for _, state := range states {
+			if state == http.StateIdle {
+				idle++
+			}
+		}
+		return accepted, idle
+	}
+
+	runWave := func(arrived <-chan struct{}, release func(), beforeRelease func()) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, parallel)
+		start := make(chan struct{})
+		for i := 0; i < parallel; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, err := client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("payload")})
+				errs <- err
+			}()
+		}
+		close(start)
+		select {
+		case <-arrived:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent request wave did not reach the server")
+		}
+		if beforeRelease != nil {
+			beforeRelease()
+		}
+		release()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("SendOne: %v", err)
+			}
+		}
+	}
+
+	runWave(firstArrived, releaseFirst, nil)
+	idleDeadline := time.NewTimer(2 * time.Second)
+	defer idleDeadline.Stop()
+	for {
+		gotAccepted, gotIdle := snapshot()
+		if gotAccepted == parallel && gotIdle == parallel {
+			break
+		}
+		select {
+		case <-stateChanged:
+		case <-idleDeadline.C:
+			t.Fatalf("first wave connections: accepted=%d idle=%d, want %d reusable idle connections", gotAccepted, gotIdle, parallel)
+		}
+	}
+
+	runWave(secondArrived, releaseSecond, func() {
+		gotAccepted, _ := snapshot()
+		if gotAccepted != parallel {
+			t.Fatalf("second wave opened new connections: accepted=%d, want %d", gotAccepted, parallel)
+		}
+	})
+	if got := atomic.LoadInt32(&requests); got != 2*parallel {
+		t.Fatalf("requests = %d, want %d", got, 2*parallel)
 	}
 }
 
