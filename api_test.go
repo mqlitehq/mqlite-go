@@ -8,12 +8,94 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
+
+func TestSendInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "untrusted-ack-marker"
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		call          func(*Client) error
+	}{
+		{
+			name: "SendOne truncated JSON",
+			body: `{"seq_numbers":["` + marker,
+			call: func(client *Client) error {
+				_, err := client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("one")})
+				return err
+			},
+		},
+		{
+			name: "Send batch truncated JSON",
+			body: `{"seq_numbers":["` + marker,
+			call: func(client *Client) error {
+				_, err := client.Send(context.Background(), "jobs",
+					OutMessage{Body: []byte("one")},
+					OutMessage{Body: []byte("two")})
+				return err
+			},
+		},
+		{
+			name:          "SendOne oversized acknowledgement",
+			body:          marker,
+			contentLength: 1 << 30,
+			call: func(client *Client) error {
+				_, err := client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("one")})
+				return err
+			},
+		},
+		{
+			name: "Send sequence count mismatch",
+			body: `{"seq_numbers":[11]}`,
+			call: func(client *Client) error {
+				_, err := client.Send(context.Background(), "jobs",
+					OutMessage{Body: []byte("one")},
+					OutMessage{Body: []byte("two")})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				if test.contentLength != 0 {
+					w.Header().Set("Content-Length", strconv.FormatInt(test.contentLength, 10))
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			err = test.call(client)
+			if !errors.Is(err, ErrOutcomeUnknown) {
+				t.Fatalf("Send error = %v, want ErrOutcomeUnknown", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("Send error reflected untrusted acknowledgement body: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("Send made %d requests, want one", got)
+			}
+		})
+	}
+}
 
 func TestReceivePreservesDeliveryIdentityForSettlement(t *testing.T) {
 	const (
@@ -124,6 +206,128 @@ func TestSettlementFalseMeansLockLost(t *testing.T) {
 	}
 }
 
+func TestTerminalSettlementInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "semantic-ack-marker"
+	tests := []struct {
+		name string
+		call func(context.Context, *Message) error
+	}{
+		{name: "complete", call: func(ctx context.Context, message *Message) error { return message.Complete(ctx) }},
+		{name: "abandon", call: func(ctx context.Context, message *Message) error { return message.Abandon(ctx) }},
+		{name: "reject", call: func(ctx context.Context, message *Message) error { return message.Reject(ctx) }},
+		{name: "defer", call: func(ctx context.Context, message *Message) error { return message.Defer(ctx) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = test.call(context.Background(), client.Message("jobs", 7, "lock-7"))
+			if !errors.Is(err, ErrOutcomeUnknown) {
+				t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("error reflected successful response content: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("requests = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestRenewInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "renew-ack-marker"
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Message("jobs", 7, "lock-7").Renew(context.Background())
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+	}
+	if errors.Is(err, ErrLockLost) {
+		t.Fatalf("missing acknowledgement was misclassified as ErrLockLost: %v", err)
+	}
+	var invalid *invalidSuccessResponseError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("error = %v, want invalid successful response", err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error reflected successful response content: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+func TestReceiveRequiresExplicitMessages(t *testing.T) {
+	const marker = "receive-ack-marker"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Receive(context.Background(), "jobs"); err == nil {
+		t.Fatal("Receive accepted a response without messages")
+	} else if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error reflected successful response content: %v", err)
+	}
+}
+
+func TestAtMostOnceReceiveInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "at-most-once-ack-marker"
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		var request wire.ReceiveRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.ReceiveMode != int(receiveAndDelete) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Receive(context.Background(), "jobs", RecvOpts{AtMostOnce: true})
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+	}
+	var invalid *invalidSuccessResponseError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("error = %v, want preserved invalid success cause", err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error reflected successful response content: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
 func TestBatchSettlementWireContract(t *testing.T) {
 	var requestErr error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -219,6 +423,34 @@ func TestRenewBatchWireContract(t *testing.T) {
 	}
 }
 
+func TestRenewBatchInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "renew-batch-ack-marker"
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{"results":[{"seq_number":7,"future":"`+marker+`"}]}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.RenewBatch(context.Background(), "jobs", client.Message("jobs", 7, "lock-7"))
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+	}
+	var invalid *invalidSuccessResponseError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("error = %v, want preserved invalid success cause", err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error reflected successful response content: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
 func TestBatchSettlementRejectsMalformedSuccess(t *testing.T) {
 	tests := []struct {
 		name string
@@ -229,9 +461,11 @@ func TestBatchSettlementRejectsMalformedSuccess(t *testing.T) {
 		{name: "complete truncated", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true}]}`, want: ErrOutcomeUnknown},
 		{name: "complete reordered", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":8,"ok":true},{"seq_number":7,"ok":true}]}`, want: ErrOutcomeUnknown},
 		{name: "complete with renewal deadline", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":true}]}`, want: ErrOutcomeUnknown},
+		{name: "complete missing item acknowledgement", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7},{"seq_number":8,"ok":false}]}`, want: ErrOutcomeUnknown},
 		{name: "complete truncated JSON", path: wire.PathCompleteBatch, body: `{"results":[`, want: ErrOutcomeUnknown},
-		{name: "renew missing deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true},{"seq_number":8,"ok":false}]}`},
-		{name: "renew stale with deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":false,"locked_until_ms":1700000000001}]}`},
+		{name: "renew missing deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true},{"seq_number":8,"ok":false}]}`, want: ErrOutcomeUnknown},
+		{name: "renew missing item acknowledgement", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"locked_until_ms":1700000000000},{"seq_number":8,"ok":false}]}`, want: ErrOutcomeUnknown},
+		{name: "renew stale with deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":false,"locked_until_ms":1700000000001}]}`, want: ErrOutcomeUnknown},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -337,8 +571,10 @@ func TestCancelBrokerNotFound(t *testing.T) {
 	}
 }
 
-func TestCancelFalseAcknowledgementIsMalformed(t *testing.T) {
+func TestCancelFalseAcknowledgementIsOutcomeUnknown(t *testing.T) {
+	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
 		_, _ = io.WriteString(w, `{"ok":false}`)
 	}))
 	defer server.Close()
@@ -347,10 +583,112 @@ func TestCancelFalseAcknowledgementIsMalformed(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = client.Cancel(context.Background(), "jobs", 19)
-	if err == nil {
-		t.Fatal("false acknowledgement: expected malformed response error")
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
 	}
 	if errors.Is(err, ErrNotFound) {
 		t.Fatalf("false acknowledgement was misclassified as ErrNotFound: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+func TestCancelInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "cancel-ack-marker"
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Cancel(context.Background(), "jobs", 19)
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("error reflected successful response content: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+func TestReceiverRetriesInvalidTerminalSettlementAcknowledgement(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		handlerErr error
+	}{
+		{name: "complete", path: wire.PathComplete},
+		{name: "abandon", path: wire.PathAbandon, handlerErr: errors.New("handler failed")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var settlements []wire.SettleRequest
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case wire.PathReceive:
+					_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+						SeqNumber: 7, LockToken: "lock-7",
+						LockedUntilMs: time.Now().Add(time.Minute).UnixNano() / int64(time.Millisecond),
+					}}})
+				case test.path:
+					var request wire.SettleRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					mu.Lock()
+					settlements = append(settlements, request)
+					call := len(settlements)
+					mu.Unlock()
+					if call == 1 {
+						_, _ = io.WriteString(w, `{"future":"not-an-ack"}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"ok":true}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var notifications int32
+			receiver := client.Receiver("jobs", WithErrorHandler(func(error) {
+				atomic.AddInt32(&notifications, 1)
+			}))
+			receiver.settleBackoff = time.Millisecond
+			receiver.maxSettleBackoff = time.Millisecond
+			receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+			ctx, cancel := context.WithCancel(context.Background())
+			err = receiver.Run(ctx, func(context.Context, *Message) error {
+				cancel()
+				return test.handlerErr
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error = %v, want context.Canceled", err)
+			}
+			mu.Lock()
+			got := append([]wire.SettleRequest(nil), settlements...)
+			mu.Unlock()
+			if len(got) != 2 || got[0] != got[1] {
+				t.Fatalf("settlements = %+v, want two identical requests", got)
+			}
+			if got[0].Queue != "jobs" || got[0].SeqNumber != 7 || got[0].LockToken != "lock-7" {
+				t.Fatalf("settlement = %+v, want original delivery identity", got[0])
+			}
+			if n := atomic.LoadInt32(&notifications); n != 0 {
+				t.Fatalf("error notifications = %d, want 0 after recovered retry", n)
+			}
+		})
 	}
 }

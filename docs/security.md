@@ -20,12 +20,19 @@ trailing query marker.
 Callers may pass a configured `*http.Client` with `WithHTTPClient` for custom
 roots, proxies, or transport controls. Do not set a short global timeout on that
 client: Receive uses request contexts for long polling. Set deadlines on each
-operation's context instead. A custom `RoundTripper` must not retry queue or
-subscription deletion: doing so would bypass the SDK's at-most-once deletion
-guard and could act on a later resource recreated under the same name.
-A custom transport must also honor `Request.Context()`. The managed receiver
-waits for an in-flight renewal to exit before terminal settlement; it cannot
-safely abandon that wait and race Complete or Abandon against the same token.
+operation's context instead. Size a custom transport's idle pool to at least the
+managed receiver concurrency plus its effective prefetch; settlement can overlap
+the next claim wave. The SDK default owns a cloned transport with 64 idle
+connections per host. `Client.Close` closes only that SDK-owned pool, never a
+caller-supplied transport. The SDK shallow-clones a supplied `http.Client` to
+enforce no-redirect RPC behavior without mutating the caller's client.
+
+A custom `RoundTripper` must not retry queue or subscription deletion: doing so
+would bypass the SDK's at-most-once deletion guard and could act on a later
+resource recreated under the same name. A custom transport must also honor
+`Request.Context()`. The managed receiver waits for an in-flight renewal to exit
+before terminal settlement; it cannot safely abandon that wait and race Complete
+or Abandon against the same token.
 
 ## Delivery and deletion
 
@@ -33,12 +40,44 @@ Delivery is at-least-once. Application side effects must be idempotent. A live
 lock token fences settlement but cannot undo an external effect that happened
 before a lease was lost.
 
+Managed renewal uses a single-item RenewBatch when available so each successful
+response supplies the committed deadline. Once an older broker reports that
+route unsupported, the receiver permanently uses legacy Renew with a
+conservative inferred deadline. Transient failures are retried only while the
+known lease is live. Recovery is silent; confirmed loss cancels that message's
+handler context and reports one `ErrLockLost`. Handlers must stop promptly when
+their context is canceled.
+
+Managed Receive keeps one `receive_attempt_id` across transport backoff. This
+replays a batch already claimed by the broker instead of claiming another one.
+The first failure gets one immediate, silent replay; a second consecutive
+failure is reported and starts exponential jittered backoff. An expired replay
+is discarded before handler dispatch. Complete and Abandon then replay the exact
+same fenced request within a five-second bound; matching broker settlement
+receipts make a lost-response replay idempotent. A handler slot is released when
+the handler returns, while a separate total-in-flight slot remains held through
+renewal shutdown and terminal settlement. The latter is capped at concurrency
+plus effective prefetch (at most twice concurrency), so settlement latency can
+overlap one claim wave without building an unbounded local lock queue.
+
 Queue and subscription deletion are name-addressed destructive operations. The
-SDK disables redirect following and never transparently retries them. A transport
-failure, redirect, invalid success acknowledgement, or gateway 5xx returns
-`ErrOutcomeUnknown`. Reconcile with `ListQueues` or lifecycle-aware subscription
-inventory before deciding what happened. Never blindly replay a delayed deletion
-after recreating the same name.
+SDK disables redirect following for every RPC and never transparently retries
+deletion. A deletion transport failure, redirect, invalid success
+acknowledgement, or gateway 5xx returns `ErrOutcomeUnknown`. Reconcile with
+`ListQueues` or lifecycle-aware subscription inventory before deciding what
+happened. Never blindly replay a delayed deletion after recreating the same name.
+Other redirected RPCs fail at the original endpoint without forwarding their
+Bearer token or request body to the redirect destination. Their errors expose
+only the HTTP status, not an untrusted `Location` header or response body.
+
+A 2xx response is not accepted as proof of a commit-capable operation unless its
+acknowledgement is present and structurally valid. Send, schedule cancel,
+Complete, Abandon, Reject, Defer, Renew, CompleteBatch, RenewBatch, and
+AtMostOnce Receive surface an invalid success acknowledgement as
+`ErrOutcomeUnknown`; the response body is not reflected into the error.
+Peek-Lock Receive can instead replay the
+same attempt ID. Only the managed receiver automatically retries identical
+fenced renewal, Complete, or Abandon requests.
 
 `force` is explicit permission to discard retained messages. It changes the
 empty-resource precondition, not the authorization level. A subscription TTL is
@@ -51,7 +90,14 @@ also receive semantic validation: required fields, state combinations, page size
 scope, ordering, cursor progress, and timestamp relationships must be coherent.
 Batch settlement responses must contain one ordered result per requested message;
 a successful renewal must also contain its committed deadline. Unknown fields
-remain forward compatible.
+remain forward compatible. An intermediary error without a JSON error code still
+retains its HTTP status in the returned error. Callers can use `errors.As` with
+`*mqlite.HTTPError` and inspect `StatusCode` without parsing error text;
+`errors.Is` sentinel matching remains intact for broker error codes.
+Resource-aware brokers add a non-secret `resource` discriminator to `not_found`.
+For a missing queue, the resulting error matches both `ErrQueueNotFound` and the
+broader `ErrNotFound`; old brokers without that additive field retain the legacy
+general match.
 
 ## Go floor
 

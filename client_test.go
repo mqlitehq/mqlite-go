@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -197,7 +198,27 @@ func TestHTTPErrorMapping(t *testing.T) {
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want errors.Is(_, %v)", err, test.want)
 			}
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != test.status {
+				t.Fatalf("error = %#v, want *HTTPError status %d", err, test.status)
+			}
 		})
+	}
+}
+
+func TestQueueNotFoundMatchesSpecificAndGeneralErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"code":"not_found","message":"mqlite: queue not found","resource":"queue"}`)
+	}))
+	defer server.Close()
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Stats(context.Background(), "missing")
+	if !errors.Is(err, ErrQueueNotFound) || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Stats error = %v, want both ErrQueueNotFound and ErrNotFound", err)
 	}
 }
 
@@ -229,6 +250,140 @@ func TestDeleteDoesNotFollowRedirect(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&destinationHits); got != 0 {
 		t.Fatalf("redirect destination requests = %d, want 0", got)
+	}
+}
+
+func TestRPCDoesNotFollowRedirect(t *testing.T) {
+	const marker = "redirect-sensitive-marker"
+	var destinationHits int32
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&destinationHits, 1)
+		_, _ = io.WriteString(w, `{"seq_numbers":[1]}`)
+	}))
+	defer destination.Close()
+
+	var sourceHits int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&sourceHits, 1)
+		w.Header().Set("Location", destination.URL+wire.PathSend+"?marker="+marker)
+		w.Header().Set("X-Redirect-Marker", marker)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = io.WriteString(w, `{"code":"`+marker+`","message":"`+marker+`"}`)
+	}))
+	defer source.Close()
+
+	client, err := Open(context.Background(), source.URL, WithToken("redirect-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("payload")})
+	if err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("SendOne error = %v, want an HTTP 307 error", err)
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("SendOne error = %#v, want *HTTPError status 307", err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("SendOne error leaked redirect metadata or body: %v", err)
+	}
+	if got := atomic.LoadInt32(&sourceHits); got != 1 {
+		t.Fatalf("source requests = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&destinationHits); got != 0 {
+		t.Fatalf("redirect destination requests = %d, want 0", got)
+	}
+}
+
+func TestHTTPErrorWithoutEnvelopeIncludesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("payload")})
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("SendOne error = %v, want HTTP status 503", err)
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != 503 || httpErr.HTTPStatus() != 503 {
+		t.Fatalf("SendOne error = %#v, want *HTTPError status 503", err)
+	}
+}
+
+func TestOpenBuildsOwnedPooledTransport(t *testing.T) {
+	client, err := Open(context.Background(), "http://broker.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.http.Transport.(*http.Transport)
+	if !ok || transport == http.DefaultTransport {
+		t.Fatalf("default transport = %#v, want an owned *http.Transport", client.http.Transport)
+	}
+	if transport.MaxIdleConnsPerHost < 64 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want at least 64", transport.MaxIdleConnsPerHost)
+	}
+}
+
+func TestClientCloseClosesOnlyOwnedIdleConnections(t *testing.T) {
+	idle := make(chan struct{}, 1)
+	closed := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"seq_numbers":[1]}`)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateIdle:
+			select {
+			case idle <- struct{}{}:
+			default:
+			}
+		case http.StateClosed:
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("payload")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-idle:
+	case <-time.After(time.Second):
+		t.Fatal("connection did not become idle")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not close the owned idle connection")
+	}
+
+	transport := &closeTrackingTransport{}
+	custom := &http.Client{Transport: transport}
+	client, err = Open(context.Background(), "http://broker.invalid", WithHTTPClient(custom))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&transport.closes); got != 0 {
+		t.Fatalf("custom transport idle closes = %d, want 0", got)
 	}
 }
 
@@ -273,6 +428,18 @@ type failingRoundTripper struct {
 func (r *failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	atomic.AddInt32(&r.calls, 1)
 	return nil, errors.New("connection reset")
+}
+
+type closeTrackingTransport struct {
+	closes int32
+}
+
+func (r *closeTrackingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected request")
+}
+
+func (r *closeTrackingTransport) CloseIdleConnections() {
+	atomic.AddInt32(&r.closes, 1)
 }
 
 func TestDeleteTransportFailureIsOutcomeUnknown(t *testing.T) {

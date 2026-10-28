@@ -7,6 +7,82 @@ import (
 	"testing"
 )
 
+func TestErrorBodyResourceIsAdditive(t *testing.T) {
+	data, err := json.Marshal(ErrorBody{Code: "not_found", Message: "missing", Resource: "queue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(`"resource":"queue"`)) {
+		t.Fatalf("error body = %s, want resource discriminator", data)
+	}
+	var legacy struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil || legacy.Code != "not_found" {
+		t.Fatalf("legacy decode = %+v, %v", legacy, err)
+	}
+}
+
+func TestSettleResponseRequiresExplicitOK(t *testing.T) {
+	valid := []struct {
+		json string
+		ok   bool
+	}{
+		{`{"ok":true}`, true},
+		{`{"ok":false,"future":"ignored"}`, false},
+	}
+	for _, tc := range valid {
+		var response SettleResponse
+		if err := json.Unmarshal([]byte(tc.json), &response); err != nil || response.Ok != tc.ok {
+			t.Fatalf("Unmarshal(%s) = %+v, %v", tc.json, response, err)
+		}
+	}
+	for _, input := range []string{`{}`, `null`, `{"ok":null}`, `{"ok":"true"}`} {
+		var response SettleResponse
+		if err := json.Unmarshal([]byte(input), &response); err == nil {
+			t.Fatalf("Unmarshal(%s) = %+v, want error", input, response)
+		}
+	}
+}
+
+func TestSettleItemResultRequiresExplicitOK(t *testing.T) {
+	valid := []struct {
+		json string
+		ok   bool
+	}{
+		{`{"seq_number":7,"ok":true,"locked_until_ms":99}`, true},
+		{`{"seq_number":7,"ok":false,"future":"ignored"}`, false},
+	}
+	for _, tc := range valid {
+		var result SettleItemResult
+		if err := json.Unmarshal([]byte(tc.json), &result); err != nil || result.SeqNumber != 7 || result.Ok != tc.ok {
+			t.Fatalf("Unmarshal(%s) = %+v, %v", tc.json, result, err)
+		}
+	}
+	for _, input := range []string{`{}`, `null`, `{"seq_number":7}`, `{"seq_number":7,"ok":null}`, `{"seq_number":7,"ok":0}`} {
+		var result SettleItemResult
+		if err := json.Unmarshal([]byte(input), &result); err == nil {
+			t.Fatalf("Unmarshal(%s) = %+v, want error", input, result)
+		}
+	}
+}
+
+func TestReceiveResponseRequiresNonNullMessages(t *testing.T) {
+	for _, input := range []string{`{"messages":[]}`, `{"messages":[],"future":"ignored"}`} {
+		var response ReceiveResponse
+		if err := json.Unmarshal([]byte(input), &response); err != nil || response.Messages == nil || len(response.Messages) != 0 {
+			t.Fatalf("Unmarshal(%s) = %+v, %v", input, response, err)
+		}
+	}
+	for _, input := range []string{`{}`, `null`, `{"messages":null}`, `{"messages":{}}`} {
+		var response ReceiveResponse
+		if err := json.Unmarshal([]byte(input), &response); err == nil {
+			t.Fatalf("Unmarshal(%s) = %+v, want error", input, response)
+		}
+	}
+}
+
 func TestDeleteResponseValidation(t *testing.T) {
 	valid := []struct {
 		json    string

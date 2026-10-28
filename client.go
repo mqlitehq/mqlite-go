@@ -23,6 +23,26 @@ func (e *invalidSuccessResponseError) Error() string {
 
 func (e *invalidSuccessResponseError) Unwrap() error { return e.cause }
 
+// HTTPError preserves the HTTP status returned by a broker or intermediary.
+// Use errors.As to inspect it while errors.Is continues to match any wrapped
+// MQLite sentinel.
+type HTTPError struct {
+	StatusCode int
+	cause      error
+}
+
+func (e *HTTPError) Error() string {
+	if e.cause == nil {
+		return fmt.Sprintf("mqlite: HTTP %d", e.StatusCode)
+	}
+	return e.cause.Error()
+}
+
+func (e *HTTPError) Unwrap() error { return e.cause }
+
+// HTTPStatus returns the response status code.
+func (e *HTTPError) HTTPStatus() int { return e.StatusCode }
+
 type ambiguousOutcomeError struct {
 	operation string
 	cause     error
@@ -47,9 +67,10 @@ const (
 
 // Client is a remote MQLite JSON-over-HTTP client.
 type Client struct {
-	endpoint string
-	token    string
-	http     *http.Client
+	endpoint  string
+	token     string
+	http      *http.Client
+	ownedHTTP bool
 }
 
 type config struct {
@@ -66,7 +87,8 @@ func WithToken(token string) Option { return func(c *config) { c.token = token }
 // WithHTTPClient supplies a custom transport, proxy, or TLS configuration.
 // Do not set a global timeout shorter than the longest Receive wait.
 // The transport must honor request contexts and must not retry queue or
-// subscription deletion requests.
+// subscription deletion requests. Size MaxIdleConnsPerHost to at least Receiver
+// concurrency plus effective prefetch so overlapped settlement reuses connections.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *config) { c.httpClient = client }
 }
@@ -90,16 +112,42 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 		token = cfg.token
 	}
 	httpClient := cfg.httpClient
+	ownedHTTP := false
 	if httpClient == nil {
 		// Receive is a long poll. The request context, not a global client timeout,
-		// owns its deadline.
-		httpClient = &http.Client{}
+		// owns its deadline. Clone the standard transport so managed receiver
+		// concurrency has a useful per-host idle pool and Client.Close can release
+		// only this client's connections.
+		base, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("mqlite: default HTTP transport has unexpected type %T; use WithHTTPClient", http.DefaultTransport)
+		}
+		transport := base.Clone()
+		transport.MaxIdleConnsPerHost = 64
+		if transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
+			transport.MaxIdleConns = transport.MaxIdleConnsPerHost
+		}
+		httpClient = &http.Client{Transport: transport}
+		ownedHTTP = true
 	}
-	return &Client{endpoint: endpoint, token: token, http: httpClient}, nil
+	// RPC endpoints never redirect. A 307/308 would replay a POST body and can
+	// forward Authorization to another port on the same host. Clone the caller's
+	// client so enforcing this policy does not mutate shared configuration.
+	clientCopy := *httpClient
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Client{endpoint: endpoint, token: token, http: &clientCopy, ownedHTTP: ownedHTTP}, nil
 }
 
-// Close releases client resources. The standard HTTP client needs no close.
-func (c *Client) Close() error { return nil }
+// Close releases idle connections owned by this client. A caller-supplied HTTP
+// client and its transport remain under the caller's ownership.
+func (c *Client) Close() error {
+	if c.ownedHTTP {
+		c.http.CloseIdleConnections()
+	}
+	return nil
+}
 
 // Endpoint returns the credential-free base URL this client dials.
 func (c *Client) Endpoint() string { return c.endpoint }
@@ -200,6 +248,13 @@ func readBounded(reader io.Reader, limit int64) ([]byte, error) {
 	return data, nil
 }
 
+func readResponseBounded(reader io.Reader, contentLength, limit int64) ([]byte, error) {
+	if contentLength > limit {
+		return nil, fmt.Errorf("mqlite: response exceeds %d bytes", limit)
+	}
+	return readBounded(reader, limit)
+}
+
 func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -215,15 +270,7 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	httpClient := c.http
-	if isLifecycleDelete(path) {
-		clone := *c.http
-		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-		httpClient = &clone
-	}
-	resp, err := httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		if isLifecycleDelete(path) {
 			return fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %v", ErrOutcomeUnknown, reconcileHint(path), err)
@@ -238,15 +285,21 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 	if isLifecycleDelete(path) && resp.StatusCode/100 == 5 {
 		return fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, reconcileHint(path))
 	}
+	if resp.StatusCode/100 == 3 {
+		// Redirect metadata and bodies come from an untrusted intermediary. RPCs
+		// never follow redirects, and ordinary calls expose only the status needed
+		// for stable classification rather than reflecting Location or body text.
+		return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("mqlite: unexpected HTTP redirect %d", resp.StatusCode)}
+	}
 	if resp.StatusCode/100 != 2 {
-		data, readErr := readBounded(resp.Body, maxErrorBytes)
+		data, readErr := readResponseBounded(resp.Body, resp.ContentLength, maxErrorBytes)
 		var errorBody wire.ErrorBody
 		if readErr == nil {
 			_ = json.Unmarshal(data, &errorBody)
 		}
 		if resp.StatusCode == http.StatusNotFound &&
 			(errorBody.Code == "" || strings.HasPrefix(errorBody.Message, "no such path")) {
-			return fmt.Errorf("%w: %s", ErrUnsupported, path)
+			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
 			errorBody.Code = "unauthenticated"
@@ -255,12 +308,12 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 			errorBody.Code = "permission_denied"
 		}
 		if path == wire.PathDeleteSubscription && errorBody.Code == "not_found" {
-			return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, errorBody.Message)
+			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, errorBody.Message)}
 		}
 		if path == wire.PathSubscribe && errorBody.Code == "resource_exhausted" {
-			return fmt.Errorf("%w: %s", ErrSubscriptionLimit, errorBody.Message)
+			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, errorBody.Message)}
 		}
-		return mapError(errorBody)
+		return &HTTPError{StatusCode: resp.StatusCode, cause: mapError(resp.StatusCode, errorBody)}
 	}
 
 	if out == nil {
@@ -273,7 +326,7 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 	case wire.PathListSubscriptionsPage:
 		data, err = wire.ReadListSubscriptionsPageResponse(resp.Body)
 	default:
-		data, err = readBounded(resp.Body, maxResponseBytes)
+		data, err = readResponseBounded(resp.Body, resp.ContentLength, maxResponseBytes)
 	}
 	if err != nil {
 		if isLifecycleDelete(path) {
@@ -291,11 +344,17 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 	return nil
 }
 
-func mapError(body wire.ErrorBody) error {
+func mapError(statusCode int, body wire.ErrorBody) error {
 	var target error
 	switch body.Code {
 	case "not_found":
-		target = ErrNotFound
+		if body.Resource == "queue" {
+			target = ErrQueueNotFound
+		} else if body.Resource == "subscription" {
+			target = ErrSubscriptionNotFound
+		} else {
+			target = ErrNotFound
+		}
 	case "already_exists":
 		target = ErrDedupConflict
 	case "queue_not_empty":
@@ -322,7 +381,7 @@ func mapError(body wire.ErrorBody) error {
 		target = ErrOutcomeUnknown
 	default:
 		if body.Code == "" {
-			return fmt.Errorf("mqlite: request failed")
+			return fmt.Errorf("mqlite: request failed: HTTP %d", statusCode)
 		}
 		return fmt.Errorf("mqlite: %s: %s", body.Code, body.Message)
 	}

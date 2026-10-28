@@ -2,6 +2,11 @@
 // SDK. It intentionally contains no broker engine or storage dependencies.
 package wire
 
+import (
+	"encoding/json"
+	"errors"
+)
+
 // Unary RPC paths. Every operation is one JSON HTTP POST.
 const (
 	PathSend            = "/mqlite.v1.QueueService/Send"
@@ -105,6 +110,24 @@ type ReceiveResponse struct {
 	Messages []Message `json:"messages"`
 }
 
+// UnmarshalJSON rejects a successful response that does not explicitly carry
+// the message list. A missing or null list is not equivalent to an empty list:
+// an intermediary could otherwise erase a claimed batch while the client moves
+// on to a new receive attempt.
+func (r *ReceiveResponse) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Messages *[]Message `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Messages == nil {
+		return errors.New("mqlite: receive response is missing messages")
+	}
+	r.Messages = *raw.Messages
+	return nil
+}
+
 type ReceiveDeferredRequest struct {
 	Queue      string  `json:"queue"`
 	SeqNumbers []int64 `json:"seq_numbers"`
@@ -123,6 +146,22 @@ type SettleResponse struct {
 	Ok bool `json:"ok"`
 }
 
+// UnmarshalJSON keeps an explicit false acknowledgement distinct from a
+// successful response whose acknowledgement was removed by an intermediary.
+func (r *SettleResponse) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Ok *bool `json:"ok"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Ok == nil {
+		return errors.New("mqlite: settlement response is missing ok")
+	}
+	r.Ok = *raw.Ok
+	return nil
+}
+
 type SettleItem struct {
 	SeqNumber int64  `json:"seq_number"`
 	LockToken string `json:"lock_token"`
@@ -137,6 +176,27 @@ type SettleItemResult struct {
 	SeqNumber     int64 `json:"seq_number"`
 	Ok            bool  `json:"ok"`
 	LockedUntilMs int64 `json:"locked_until_ms,omitempty"`
+}
+
+// UnmarshalJSON requires every batch item to acknowledge its outcome. The bool
+// remains a value field in the public shape; the pointer is decode-only presence
+// tracking so explicit false stays valid.
+func (r *SettleItemResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		SeqNumber     int64 `json:"seq_number"`
+		Ok            *bool `json:"ok"`
+		LockedUntilMs int64 `json:"locked_until_ms,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Ok == nil {
+		return errors.New("mqlite: batch settlement result is missing ok")
+	}
+	r.SeqNumber = raw.SeqNumber
+	r.Ok = *raw.Ok
+	r.LockedUntilMs = raw.LockedUntilMs
+	return nil
 }
 
 type CompleteBatchResponse struct {
@@ -337,6 +397,7 @@ type StatusResponse struct {
 type Empty struct{}
 
 type ErrorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Resource string `json:"resource,omitempty"`
 }

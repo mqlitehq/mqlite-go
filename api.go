@@ -55,6 +55,8 @@ func filterToWire(filter *Filter) *wire.Filter {
 // SendOne sends or schedules one message and returns its sequence number. When
 // queue names a topic, only active matching subscriptions retain a copy; a
 // successful publish with no match returns sequence zero and stores no history.
+// An invalid successful acknowledgement returns ErrOutcomeUnknown because the
+// message may already have committed; reconcile before retrying.
 func (c *Client) SendOne(ctx context.Context, queue string, message OutMessage, opts ...SendOpts) (int64, error) {
 	if err := validateOutMessageTTL(message); err != nil {
 		return 0, err
@@ -76,15 +78,24 @@ func (c *Client) SendOne(ctx context.Context, queue string, message OutMessage, 
 	}
 	response := wire.SendResponse{}
 	if err := c.post(ctx, path, request, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return 0, &ambiguousOutcomeError{operation: "Send", cause: err}
+		}
 		return 0, err
 	}
 	if len(response.SeqNumbers) != 1 {
-		return 0, fmt.Errorf("mqlite: malformed Send response")
+		return 0, &ambiguousOutcomeError{
+			operation: "Send",
+			cause:     fmt.Errorf("received %d sequence numbers for 1 message", len(response.SeqNumbers)),
+		}
 	}
 	return response.SeqNumbers[0], nil
 }
 
-// Send atomically enqueues one or more messages. An empty batch is a no-op.
+// Send atomically enqueues one or more messages. An empty batch is a no-op. An
+// invalid successful acknowledgement returns ErrOutcomeUnknown because the
+// batch may already have committed; reconcile before retrying.
 func (c *Client) Send(ctx context.Context, queue string, messages ...OutMessage) ([]int64, error) {
 	if len(messages) == 0 {
 		return nil, nil
@@ -118,22 +129,38 @@ func (c *Client) Send(ctx context.Context, queue string, messages ...OutMessage)
 	}
 	response := wire.SendResponse{}
 	if err := c.post(ctx, wire.PathSend, request, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, &ambiguousOutcomeError{operation: "Send", cause: err}
+		}
 		return nil, err
 	}
 	if len(response.SeqNumbers) != len(messages) {
-		return nil, fmt.Errorf("mqlite: malformed Send response")
+		return nil, &ambiguousOutcomeError{
+			operation: "Send",
+			cause:     fmt.Errorf("received %d sequence numbers for %d messages", len(response.SeqNumbers), len(messages)),
+		}
 	}
 	return response.SeqNumbers, nil
 }
 
-// Cancel removes one never-delivered scheduled message.
+// Cancel removes one never-delivered scheduled message. An invalid successful
+// acknowledgement returns ErrOutcomeUnknown because cancellation may already
+// have committed.
 func (c *Client) Cancel(ctx context.Context, queue string, sequenceNumber int64) error {
 	response := wire.SettleResponse{}
 	if err := c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: sequenceNumber}, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return &ambiguousOutcomeError{operation: "Cancel", cause: err}
+		}
 		return err
 	}
 	if !response.Ok {
-		return fmt.Errorf("mqlite: malformed Cancel response")
+		return &ambiguousOutcomeError{
+			operation: "Cancel",
+			cause:     errors.New("successful response did not confirm cancellation"),
+		}
 	}
 	return nil
 }
@@ -218,12 +245,30 @@ func (c *Client) RenewBatch(ctx context.Context, queue string, messages ...*Mess
 	}
 	response := wire.RenewBatchResponse{}
 	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, &ambiguousOutcomeError{operation: "RenewBatch", cause: err}
+		}
 		return nil, err
 	}
 	if err := validateBatchResults(messages, response.Results, true); err != nil {
-		return nil, fmt.Errorf("mqlite: invalid RenewBatch response: %w", err)
+		return nil, &ambiguousOutcomeError{operation: "RenewBatch", cause: err}
 	}
 	return settleResults(response.Results), nil
+}
+
+// renewLease is the managed receiver's deadline-bearing renewal path. The
+// public single-message Renew route predates deadline responses, while
+// RenewBatch reports the committed lease deadline even for one item.
+func (c *Client) renewLease(ctx context.Context, message *Message) (time.Time, error) {
+	results, err := c.RenewBatch(ctx, message.queue, message)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if len(results) != 1 || !results[0].Ok {
+		return time.Time{}, ErrLockLost
+	}
+	return results[0].LockedUntil, nil
 }
 
 // Receive claims messages with Peek-Lock by default. Pick retrieves deferred
@@ -249,6 +294,10 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			Queue: queue, MaxMessages: max, WaitTimeMs: option.Wait.Milliseconds(),
 			ReceiveMode: int(option.mode()), AttemptID: option.Attempt,
 		}, &response); err != nil {
+			var invalid *invalidSuccessResponseError
+			if option.mode() == receiveAndDelete && errors.As(err, &invalid) {
+				return nil, &ambiguousOutcomeError{operation: "ReceiveAtMostOnce", cause: err}
+			}
 			return nil, err
 		}
 	}
@@ -541,12 +590,33 @@ func (c *Client) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 func (c *Client) settle(ctx context.Context, path string, request wire.SettleRequest) error {
 	response := wire.SettleResponse{}
 	if err := c.post(ctx, path, request, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if operation := ambiguousSettlementOperation(path); operation != "" && errors.As(err, &invalid) {
+			return &ambiguousOutcomeError{operation: operation, cause: err}
+		}
 		return err
 	}
 	if !response.Ok {
 		return ErrLockLost
 	}
 	return nil
+}
+
+func ambiguousSettlementOperation(path string) string {
+	switch path {
+	case wire.PathComplete:
+		return "Complete"
+	case wire.PathAbandon:
+		return "Abandon"
+	case wire.PathReject:
+		return "Reject"
+	case wire.PathDefer:
+		return "Defer"
+	case wire.PathRenew:
+		return "Renew"
+	default:
+		return ""
+	}
 }
 
 func (c *Client) complete(ctx context.Context, queue string, sequenceNumber int64, token string) error {
