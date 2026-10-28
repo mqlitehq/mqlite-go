@@ -2,8 +2,10 @@ package live_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,7 +60,7 @@ func TestBrokerRoundTrip(t *testing.T) {
 		t.Fatalf("stats after complete: %+v err=%v", stats, err)
 	}
 
-	if err := client.SubscribeWithOptions(ctx, topic, subscription, nil, mqlite.SubscribeOptions{TTL: 2 * time.Minute}); err != nil {
+	if err := client.Subscribe(ctx, topic, subscription, nil); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 	defer func() {
@@ -66,18 +68,69 @@ func TestBrokerRoundTrip(t *testing.T) {
 		defer cleanupCancel()
 		_, _ = client.DeleteSubscriptionWithOptions(cleanupCtx, topic, subscription, mqlite.DeleteSubscriptionOpts{Force: true})
 	}()
-	if _, err := client.SendOne(ctx, topic, mqlite.OutMessage{Body: []byte("fanout")}); err != nil {
-		t.Fatalf("publish: %v", err)
+	const fanoutMessages = 16
+	receiverCtx, stopReceiver := context.WithCancel(ctx)
+	defer stopReceiver()
+	received := make(chan string, fanoutMessages)
+	receiverDone := make(chan error, 1)
+	var receivedCount int32
+	go func() {
+		receiverDone <- client.Receiver(subscription,
+			mqlite.WithConcurrency(4),
+			mqlite.WithPrefetch(4),
+			mqlite.WithAutoRenew(),
+		).Run(receiverCtx, func(_ context.Context, message *mqlite.Message) error {
+			received <- string(message.Body)
+			if atomic.AddInt32(&receivedCount, 1) == fanoutMessages {
+				stopReceiver()
+			}
+			return nil
+		})
+	}()
+	published := make([]mqlite.OutMessage, fanoutMessages)
+	for i := range published {
+		published[i] = mqlite.OutMessage{
+			Body:      []byte(fmt.Sprintf("fanout-%d", i)),
+			MessageID: fmt.Sprintf("fanout-%s-%d", suffix, i),
+		}
 	}
-	messages, err = client.Receive(ctx, subscription, mqlite.RecvOpts{Max: 1, Wait: 5 * time.Second})
-	if err != nil || len(messages) != 1 || string(messages[0].Body) != "fanout" {
-		t.Fatalf("subscription receive: messages=%d err=%v", len(messages), err)
+	sequences, err := client.Send(ctx, topic, published...)
+	if err != nil || len(sequences) != fanoutMessages {
+		stopReceiver()
+		t.Fatalf("publish: sequences=%d err=%v", len(sequences), err)
 	}
-	if err := messages[0].Complete(ctx); err != nil {
-		t.Fatalf("complete subscription message: %v", err)
+	for i, sequence := range sequences {
+		if sequence <= 0 {
+			stopReceiver()
+			t.Fatalf("publish sequence %d = %d, want positive fan-out acknowledgement", i, sequence)
+		}
+	}
+	select {
+	case err := <-receiverDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("subscription receiver: %v", err)
+		}
+	case <-ctx.Done():
+		stopReceiver()
+		t.Fatalf("subscription receiver timeout: %v", ctx.Err())
+	}
+	seen := make(map[string]int, fanoutMessages)
+	for i := 0; i < fanoutMessages; i++ {
+		seen[<-received]++
+	}
+	for i := 0; i < fanoutMessages; i++ {
+		body := fmt.Sprintf("fanout-%d", i)
+		if seen[body] != 1 {
+			t.Fatalf("delivery count for %q = %d, want 1", body, seen[body])
+		}
+	}
+	stats, err = client.Stats(ctx, subscription)
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("subscription stats after receiver: %+v err=%v", stats, err)
 	}
 	page, err := client.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{Topic: topic, Limit: 10})
-	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].Name != subscription {
+	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 ||
+		page.Subscriptions[0].Name != subscription || page.Subscriptions[0].ExpiresAtMs != 0 {
 		t.Fatalf("subscription inventory: %+v err=%v", page, err)
 	}
 	deleted, err := client.DeleteSubscriptionWithOptions(ctx, topic, subscription)

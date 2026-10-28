@@ -87,7 +87,50 @@ handlers and custom HTTP transports must honor request contexts, and an error
 handler must return promptly. The receiver waits for an in-flight renewal to
 exit before it completes or abandons the same lock token.
 
-## Topics and temporary subscriptions
+## Topics and subscriptions
+
+For a long-lived listener, provision one stable subscription without a TTL and
+run one managed receiver for the subscription name:
+
+```go
+if err := admin.Subscribe(ctx, "sentinel-events", "sentinel-monitor", nil); err != nil {
+	log.Fatal(err)
+}
+
+runErr := listener.Receiver("sentinel-monitor",
+	mqlite.WithConcurrency(4),
+	mqlite.WithPrefetch(4),
+	mqlite.WithAutoRenew(),
+	mqlite.WithErrorHandler(reportReceiverError),
+).Run(ctx, func(ctx context.Context, message *mqlite.Message) error {
+	return processIdempotently(ctx, message)
+})
+if runErr != nil && !errors.Is(runErr, context.Canceled) {
+	log.Fatal(runErr)
+}
+```
+
+Call `Run` once and cancel its context to stop it; the SDK performs the repeated
+20-second long polls, bounded dispatch, lock renewal, Complete, and immediate
+Abandon. The receiver target is `sentinel-monitor`, not `sentinel-events`.
+Against broker v0.4.1, use a manager to provision the subscription and a
+listener credential for the running worker.
+
+Processes sharing one subscription are competing consumers: each fan-out copy
+goes to one of them. Give each logical observer a distinct subscription when
+every observer needs its own copy. A publish has no topic-level history: a
+subscription created later receives no earlier messages. On an existing topic,
+a successful publish matching no subscription filter returns sequence zero and
+stores no copy; after the last active subscription is gone, the implicit topic
+is unavailable.
+
+Use application counters around the handler and `WithErrorHandler`, plus
+`client.Stats(ctx, subscription)` and broker metrics for active, locked, and
+dead-lettered messages. The SDK does not add always-on telemetry to the hot
+path. Reuse the client and receiver, make the handler idempotent, do not retain
+message bodies after processing, and keep the error callback non-blocking.
+
+For a temporary listener, set a fixed subscription TTL:
 
 ```go
 err := client.SubscribeWithOptions(ctx, "replies", "worker-7", nil,
@@ -101,6 +144,10 @@ A subscription TTL is a fixed lifetime from first creation. Retries, filter
 updates, traffic, and receives do not extend it. Expiry preauthorizes retained
 messages to be discarded during bounded cleanup. Explicit deletion, with or
 without `force`, is an administrative operation.
+
+Managed handlers intentionally choose only Complete (`nil`) or immediate
+Abandon (non-nil error). Use an explicit `Receive` loop when one handler needs
+delayed Abandon, Reject, Defer, or receive-and-delete semantics.
 
 Authorization is enforced by the broker. The currently released MQLite v0.4.1
 requires `manage` for subscription provisioning; later broker releases may allow
@@ -147,6 +194,15 @@ most once: redirects, transport failures, and gateway 5xx responses return
 `CompleteBatch` also reports `ErrOutcomeUnknown` when a successful HTTP response
 does not acknowledge the requested messages coherently; some completions may
 already have committed.
+
+`Receiver.Run` always uses Peek-Lock; a process crash or lost Complete response
+can cause redelivery rather than silent removal. Explicit
+`Receive(..., RecvOpts{AtMostOnce: true})`, subscription TTL expiry, force
+deletion, purge, cancel, and configured DLQ retention are deliberate data
+removal boundaries. Message TTL expiry enters the DLQ by default and discards
+only when the queue disables dead-letter-on-expire. A send transport failure can
+be ambiguous, so producers that cannot recreate work should use an application
+outbox and stable message identity; consumers must still be idempotent.
 
 All SDK times cross the wire as UTC epoch milliseconds. Resource names are the
 public identity; callers must serialize same-name deletion and recreation.
