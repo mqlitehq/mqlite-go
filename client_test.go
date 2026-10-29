@@ -330,6 +330,59 @@ func TestOpenBuildsOwnedPooledTransport(t *testing.T) {
 	}
 }
 
+type wrappingRoundTripper struct {
+	base   http.RoundTripper
+	calls  int32
+	closes int32
+}
+
+func (r *wrappingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&r.calls, 1)
+	return r.base.RoundTrip(request)
+}
+
+func (r *wrappingRoundTripper) CloseIdleConnections() {
+	atomic.AddInt32(&r.closes, 1)
+}
+
+func TestOpenUsesWrappedDefaultTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(wire.SendResponse{SeqNumbers: []int64{1}})
+	}))
+	defer server.Close()
+
+	original := http.DefaultTransport
+	wrapper := &wrappingRoundTripper{base: original}
+	http.DefaultTransport = wrapper
+	defer func() { http.DefaultTransport = original }()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("Open with wrapped http.DefaultTransport: %v", err)
+	}
+	if client.http.Transport != wrapper {
+		t.Fatalf("client transport = %#v, want wrapped default transport", client.http.Transport)
+	}
+	if client.ownedHTTP {
+		t.Fatal("wrapped global transport must remain caller-owned")
+	}
+	if client.http.CheckRedirect == nil || !errors.Is(client.http.CheckRedirect(nil, nil), http.ErrUseLastResponse) {
+		t.Fatal("wrapped default transport must retain the no-redirect RPC policy")
+	}
+	if _, err := client.SendOne(context.Background(), "jobs", OutMessage{Body: []byte("payload")}); err != nil {
+		t.Fatalf("SendOne with wrapped http.DefaultTransport: %v", err)
+	}
+	if got := atomic.LoadInt32(&wrapper.calls); got != 1 {
+		t.Fatalf("wrapped transport calls = %d, want 1", got)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := atomic.LoadInt32(&wrapper.closes); got != 0 {
+		t.Fatalf("wrapped transport idle closes = %d, want external ownership", got)
+	}
+}
+
 func TestOwnedTransportReusesConcurrentConnections(t *testing.T) {
 	const parallel = 8
 

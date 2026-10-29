@@ -17,7 +17,10 @@ const (
 	receiveAndDelete
 )
 
-const leaseDeadlineSafety = 10 * time.Millisecond
+const (
+	leaseDeadlineSafety       = 10 * time.Millisecond
+	uncertainLeaseRenewPeriod = 100 * time.Millisecond
+)
 
 type receiveSource interface {
 	settler
@@ -353,7 +356,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		cutoff := time.Now().Add(leaseDeadlineSafety)
 		for _, message := range messages {
 			if message == nil || message.LockedUntil.IsZero() ||
-				(hadTransientFailure && !message.LockedUntil.After(cutoff)) {
+				(hadTransientFailure && !r.cfg.autoRenew && !message.LockedUntil.After(cutoff)) {
 				unusable++
 				continue
 			}
@@ -369,22 +372,23 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		}
 
 		releaseWorkerPairs(handlerSlots, totalSlots, reserved-len(messages))
+		forceInitialRenewal := hadTransientFailure
 		for _, message := range messages {
 			workers.Add(1)
-			go func(m *Message) {
+			go func(m *Message, forceInitialRenewal bool) {
 				defer workers.Done()
 				defer func() { <-totalSlots }()
-				r.processWithHandlerRelease(runCtx, m, handler, func() { <-handlerSlots }, fail)
-			}(message)
+				r.processWithHandlerRelease(runCtx, m, handler, func() { <-handlerSlots }, fail, forceInitialRenewal)
+			}(message, forceInitialRenewal)
 		}
 	}
 }
 
 func (r *Receiver) process(ctx context.Context, message *Message, handler func(context.Context, *Message) error, fail func(error)) {
-	r.processWithHandlerRelease(ctx, message, handler, func() {}, fail)
+	r.processWithHandlerRelease(ctx, message, handler, func() {}, fail, false)
 }
 
-func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Message, handler func(context.Context, *Message) error, releaseHandler func(), fail func(error)) {
+func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Message, handler func(context.Context, *Message) error, releaseHandler func(), fail func(error), forceInitialRenewal bool) {
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	defer cancelHandler()
 	handlerReleased := false
@@ -398,12 +402,19 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	var renewDone chan error
 	var renewErr error
 	if r.cfg.autoRenew {
-		deadline := message.LockedUntil
-		leaseLength := time.Until(deadline)
+		deadline, leaseLength := anchorLeaseDeadline(message.LockedUntil)
+		if forceInitialRenewal {
+			// A replayed attempt may be stale even when client clock skew makes its
+			// wire deadline look far in the future. Do not let that untrusted value
+			// become the lease estimate for a legacy Renew fallback. A successful
+			// deadline-bearing renewal below can establish a new trusted horizon.
+			deadline = time.Time{}
+			leaseLength = 0
+		}
 		if leaseLength <= 0 {
 			leaseLength = 0
 		}
-		if !deadline.After(time.Now().Add(leaseDeadlineSafety)) {
+		if forceInitialRenewal || leaseLength <= leaseDeadlineSafety {
 			if ctx.Err() != nil {
 				return
 			}
@@ -429,13 +440,20 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 				r.loseLease(cancelHandler, ErrLockLost)
 				return
 			}
-			now := time.Now()
-			if until.IsZero() || !until.After(now.Add(leaseDeadlineSafety)) {
-				r.loseLease(cancelHandler, ErrLockLost)
-				return
+			confirmedDeadline, remaining := anchorLeaseDeadline(until)
+			if remaining > leaseDeadlineSafety {
+				deadline = confirmedDeadline
+				leaseLength = remaining
+			} else {
+				// A successful renewal is authoritative proof that the broker still
+				// owns this token even when clock skew makes its absolute deadline
+				// unusable locally, or a legacy Renew reports no deadline. Keep that
+				// proof separate from the local schedule. Without known headroom, the
+				// renew loop uses a conservative cadence and cancels on its first
+				// renewal failure.
+				deadline = time.Time{}
+				leaseLength = 0
 			}
-			deadline = until
-			leaseLength = until.Sub(now)
 		}
 		if ctx.Err() != nil {
 			return
@@ -544,6 +562,30 @@ func autoRenewInterval(remaining time.Duration) time.Duration {
 	return interval
 }
 
+func anchorLeaseDeadline(remote time.Time) (time.Time, time.Duration) {
+	if remote.IsZero() {
+		return time.Time{}, 0
+	}
+	now := time.Now()
+	remaining := remote.Sub(now)
+	// Wire timestamps carry wall time only. Rebuild the deadline from time.Now
+	// so later time.Until calls use Go's monotonic clock and ignore wall-clock
+	// corrections after this response was received.
+	return now.Add(remaining), remaining
+}
+
+func renewalAttemptContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		// The broker confirmed ownership but supplied no locally usable retry
+		// window. Bound each probe to one conservative cadence so a hung HTTP
+		// exchange cannot leave the handler running indefinitely.
+		return context.WithTimeout(parent, uncertainLeaseRenewPeriod)
+	}
+	// Stop the RPC before the last safety margin is spent. deadline was
+	// re-anchored onto Go's monotonic clock when it entered the renewal state.
+	return context.WithDeadline(parent, deadline.Add(-leaseDeadlineSafety))
+}
+
 const minimumRenewRetryHeadroom = 5 * time.Millisecond
 
 func retryableRenewError(err error) bool {
@@ -602,9 +644,13 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 	for {
 		var delay time.Duration
 		if failures == 0 {
-			delay = autoRenewInterval(time.Until(deadline))
+			if deadline.IsZero() {
+				delay = uncertainLeaseRenewPeriod
+			} else {
+				delay = autoRenewInterval(time.Until(deadline) - leaseDeadlineSafety)
+			}
 		} else {
-			remaining := time.Until(deadline)
+			remaining := time.Until(deadline) - leaseDeadlineSafety
 			if !deadline.IsZero() && remaining <= 2*minimumRenewRetryHeadroom {
 				return r.loseLease(cancelHandler, ErrLockLost)
 			}
@@ -623,17 +669,29 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			return nil
 		}
 
-		until, err := r.renewMessage(ctx, message, leaseLength)
-		if err == nil {
-			failures = 0
-			if until.IsZero() || !until.After(time.Now().Add(leaseDeadlineSafety)) {
-				return r.loseLease(cancelHandler, ErrLockLost)
-			}
-			deadline = until
-			continue
-		}
+		renewCtx, cancelRenew := renewalAttemptContext(ctx, deadline)
+		until, err := r.renewMessage(renewCtx, message, leaseLength)
+		attemptErr := renewCtx.Err()
+		cancelRenew()
 		if ctx.Err() != nil {
 			return nil
+		}
+		if attemptErr != nil {
+			// The attempt consumed every locally defensible millisecond. Even a
+			// late transport result cannot restore a safe settlement window.
+			return r.loseLease(cancelHandler, attemptErr)
+		}
+		if err == nil {
+			failures = 0
+			confirmedDeadline, remaining := anchorLeaseDeadline(until)
+			if remaining > leaseDeadlineSafety {
+				deadline = confirmedDeadline
+				leaseLength = remaining
+			} else {
+				deadline = time.Time{}
+				leaseLength = 0
+			}
+			continue
 		}
 		if !retryableRenewError(err) {
 			if permanentReceiverError(err) {
@@ -641,6 +699,12 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 				r.settleError(err, fail)
 				return err
 			}
+			return r.loseLease(cancelHandler, err)
+		}
+		if deadline.IsZero() {
+			// The last acknowledgement proved ownership, but an unusable remote
+			// deadline gives no local retry budget. Cancel rather than allowing a
+			// second handler to overlap after an unbounded transient outage.
 			return r.loseLease(cancelHandler, err)
 		}
 		failures++

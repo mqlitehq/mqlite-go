@@ -95,7 +95,9 @@ func WithHTTPClient(client *http.Client) Option {
 
 // Open creates a remote client. Supported connection strings are http(s) URLs
 // and mqlite(s)://token@host[:port]. The context is retained for API parity with
-// the main MQLite SDK; individual calls use their own contexts.
+// the main MQLite SDK; individual calls use their own contexts. Open clones and
+// owns the standard *http.Transport. If http.DefaultTransport was replaced by a
+// wrapper, Open preserves that wrapper and leaves its pool lifecycle to its owner.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 	_ = ctx
 	endpoint, token, err := parseDSN(dsn)
@@ -118,17 +120,21 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 		// owns its deadline. Clone the standard transport so managed receiver
 		// concurrency has a useful per-host idle pool and Client.Close can release
 		// only this client's connections.
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			return nil, fmt.Errorf("mqlite: default HTTP transport has unexpected type %T; use WithHTTPClient", http.DefaultTransport)
+		if base, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport := base.Clone()
+			transport.MaxIdleConnsPerHost = 64
+			if transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
+				transport.MaxIdleConns = transport.MaxIdleConnsPerHost
+			}
+			httpClient = &http.Client{Transport: transport}
+			ownedHTTP = true
+		} else {
+			// Instrumentation and HTTP test packages commonly wrap the process-wide
+			// transport. Preserve that behavior instead of making an SDK upgrade a
+			// startup failure. The wrapper and its connection pool remain externally
+			// owned, exactly as they are for a caller-supplied HTTP client.
+			httpClient = &http.Client{Transport: http.DefaultTransport}
 		}
-		transport := base.Clone()
-		transport.MaxIdleConnsPerHost = 64
-		if transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
-			transport.MaxIdleConns = transport.MaxIdleConnsPerHost
-		}
-		httpClient = &http.Client{Transport: transport}
-		ownedHTTP = true
 	}
 	// RPC endpoints never redirect. A 307/308 would replay a POST body and can
 	// forward Authorization to another port on the same host. Clone the caller's

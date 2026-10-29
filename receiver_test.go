@@ -1417,7 +1417,7 @@ func TestReceiverGatesUnsafeInitialLeaseBeforeHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy renewal without a deadline cannot release dispatch", func(t *testing.T) {
+	t.Run("legacy renewal without a deadline releases dispatch", func(t *testing.T) {
 		source := &fakeReceiveSource{}
 		source.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
 			if call == 1 {
@@ -1434,29 +1434,24 @@ func TestReceiverGatesUnsafeInitialLeaseBeforeHandler(t *testing.T) {
 		var handlerCalls int32
 		err := newReceiver(source, "jobs", []ReceiverOption{
 			WithAutoRenew(),
-			WithErrorHandler(func(err error) {
-				if !errors.Is(err, ErrLockLost) {
-					t.Errorf("error notification = %v, want ErrLockLost", err)
-				}
-				atomic.AddInt32(&observed, 1)
-				cancel()
-			}),
+			WithErrorHandler(func(error) { atomic.AddInt32(&observed, 1) }),
 		}).Run(ctx, func(context.Context, *Message) error {
 			atomic.AddInt32(&handlerCalls, 1)
+			cancel()
 			return nil
 		})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run error = %v, want context.Canceled", err)
 		}
-		if got := atomic.LoadInt32(&observed); got != 1 {
-			t.Fatalf("error notifications = %d, want 1", got)
+		if got := atomic.LoadInt32(&observed); got != 0 {
+			t.Fatalf("error notifications = %d, want 0", got)
 		}
-		if got := atomic.LoadInt32(&handlerCalls); got != 0 {
-			t.Fatalf("handler calls = %d, want 0 without a confirmed deadline", got)
+		if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+			t.Fatalf("handler calls = %d, want 1 after confirmed legacy Renew", got)
 		}
 		settles := source.settleSnapshot()
-		if len(settles) != 1 || settles[0].op != "renew" {
-			t.Fatalf("operations = %+v, want one legacy Renew and no terminal settlement", settles)
+		if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
+			t.Fatalf("operations = %+v, want legacy Renew then Complete", settles)
 		}
 	})
 
@@ -1490,6 +1485,439 @@ func TestReceiverGatesUnsafeInitialLeaseBeforeHandler(t *testing.T) {
 			t.Fatalf("renew calls = %d, want no dispatch-gate request for a usable lease", got)
 		}
 	})
+}
+
+func TestReceiverAutoRenewUsesConfirmedLeaseWhenClientClockIsAhead(t *testing.T) {
+	tests := []struct {
+		name         string
+		lostResponse bool
+		wantReceives int
+	}{
+		{name: "first response", wantReceives: 1},
+		{name: "replayed response", lostResponse: true, wantReceives: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			base.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
+				if test.lostResponse && call == 1 {
+					return nil, errors.New("lost receive response")
+				}
+				if call == test.wantReceives {
+					message := base.message(46)
+					// Model a client clock two seconds ahead of a broker whose
+					// lock duration is one second.
+					message.LockedUntil = time.Now().Add(-time.Second)
+					return []*Message{message}, nil
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			var renewCalls int32
+			renewedAfterDispatch := make(chan struct{})
+			source := &deadlineLeaseSource{fakeReceiveSource: base}
+			source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+				if atomic.AddInt32(&renewCalls, 1) == 2 {
+					close(renewedAfterDispatch)
+				}
+				// Renewal committed at the broker, but its absolute deadline
+				// remains in the past according to the client's fast clock.
+				return time.Now().Add(-time.Second), nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			var handlerCalls int32
+			var observed int32
+			receiver := newReceiver(source, "jobs", []ReceiverOption{
+				WithAutoRenew(),
+				WithErrorHandler(func(error) {
+					atomic.AddInt32(&observed, 1)
+					cancel()
+				}),
+			})
+			err := receiver.Run(ctx, func(context.Context, *Message) error {
+				atomic.AddInt32(&handlerCalls, 1)
+				select {
+				case <-renewedAfterDispatch:
+				case <-time.After(time.Second):
+					t.Error("confirmed skewed lease was not renewed again")
+				}
+				cancel()
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error = %v, want context.Canceled", err)
+			}
+			if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+				t.Fatalf("handler calls = %d, want 1", got)
+			}
+			if got := atomic.LoadInt32(&renewCalls); got < 2 {
+				t.Fatalf("renew calls = %d, want initial confirmation plus one managed renewal", got)
+			}
+			if got := atomic.LoadInt32(&observed); got != 0 {
+				t.Fatalf("error notifications = %d, want 0", got)
+			}
+			if got := len(base.receiveSnapshot()); got != test.wantReceives {
+				t.Fatalf("receive calls = %d, want %d", got, test.wantReceives)
+			}
+			settles := base.settleSnapshot()
+			if len(settles) != 1 || settles[0].op != "complete" || settles[0].seq != 46 {
+				t.Fatalf("settlements = %+v, want confirmed message completed", settles)
+			}
+		})
+	}
+}
+
+func TestReceiverAutoRenewFencesEveryAttemptReplay(t *testing.T) {
+	tests := []struct {
+		name        string
+		renewErr    error
+		wantHandler int32
+		wantErrors  int32
+	}{
+		{name: "renew success", wantHandler: 1},
+		{name: "lock lost", renewErr: ErrLockLost, wantErrors: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			base.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
+				switch call {
+				case 1:
+					return nil, errors.New("lost receive response")
+				case 2:
+					message := base.message(48)
+					// A slow client clock can make a lease that is stale at the
+					// broker still appear comfortably usable locally.
+					message.LockedUntil = time.Now().Add(time.Hour)
+					return []*Message{message}, nil
+				default:
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+			}
+			var renewCalls int32
+			source := &deadlineLeaseSource{fakeReceiveSource: base}
+			source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+				atomic.AddInt32(&renewCalls, 1)
+				if test.renewErr != nil {
+					return time.Time{}, test.renewErr
+				}
+				return time.Now().Add(time.Minute), nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			var handlerCalls int32
+			var observed int32
+			receiver := newReceiver(source, "jobs", []ReceiverOption{
+				WithAutoRenew(),
+				WithErrorHandler(func(err error) {
+					if !errors.Is(err, ErrLockLost) {
+						t.Errorf("error notification = %v, want ErrLockLost", err)
+					}
+					atomic.AddInt32(&observed, 1)
+					cancel()
+				}),
+			})
+			err := receiver.Run(ctx, func(context.Context, *Message) error {
+				atomic.AddInt32(&handlerCalls, 1)
+				cancel()
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error = %v, want context.Canceled", err)
+			}
+			if got := atomic.LoadInt32(&renewCalls); got != 1 {
+				t.Fatalf("renew calls = %d, want one replay fence", got)
+			}
+			if got := atomic.LoadInt32(&handlerCalls); got != test.wantHandler {
+				t.Fatalf("handler calls = %d, want %d", got, test.wantHandler)
+			}
+			if got := atomic.LoadInt32(&observed); got != test.wantErrors {
+				t.Fatalf("error notifications = %d, want %d", got, test.wantErrors)
+			}
+			receives := base.receiveSnapshot()
+			if len(receives) != 2 || receives[0].attemptID == "" || receives[0].attemptID != receives[1].attemptID {
+				t.Fatalf("receive attempts = %+v, want one exact replay", receives)
+			}
+			settles := base.settleSnapshot()
+			if test.wantHandler == 1 {
+				if len(settles) != 1 || settles[0].op != "complete" || settles[0].seq != 48 {
+					t.Fatalf("settlements = %+v, want replayed message completed", settles)
+				}
+			} else if len(settles) != 0 {
+				t.Fatalf("settlements = %+v, want none after replay fence failed", settles)
+			}
+		})
+	}
+}
+
+func TestReceiverAutoRenewReplayKeepsLegacyDeadlineUntrusted(t *testing.T) {
+	base := &fakeReceiveSource{}
+	base.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
+		switch call {
+		case 1:
+			return nil, errors.New("lost receive response")
+		case 2:
+			message := base.message(51)
+			// A slow client clock makes the replayed broker deadline look far
+			// enough away that it must not become a legacy lease estimate.
+			message.LockedUntil = time.Now().Add(time.Hour)
+			return []*Message{message}, nil
+		default:
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+	thirdRenew := make(chan struct{})
+	base.renewFn = func(call int) error {
+		if call == 3 {
+			close(thirdRenew)
+		}
+		return nil
+	}
+	var deadlineRenewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+		atomic.AddInt32(&deadlineRenewCalls, 1)
+		return time.Time{}, ErrUnsupported
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var handlerCalls int32
+	var observed int32
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(error) {
+			atomic.AddInt32(&observed, 1)
+			cancel()
+		}),
+	})
+	err := receiver.Run(ctx, func(context.Context, *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		select {
+		case <-thirdRenew:
+		case <-time.After(time.Second):
+			t.Error("legacy replay inherited the untrusted future deadline")
+		}
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&deadlineRenewCalls); got != 1 {
+		t.Fatalf("deadline-bearing renew calls = %d, want one capability probe", got)
+	}
+	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&observed); got != 0 {
+		t.Fatalf("error notifications = %d, want 0", got)
+	}
+	settles := base.settleSnapshot()
+	var renews, completes int
+	for _, record := range settles {
+		switch record.op {
+		case "renew":
+			renews++
+		case "complete":
+			completes++
+		}
+	}
+	if renews != 3 || completes != 1 {
+		t.Fatalf("settlements = %+v, want three legacy Renews then Complete", settles)
+	}
+}
+
+func TestReceiverFailsClosedWhenSkewedLeaseRenewalFails(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(47)
+	message.LockedUntil = time.Now().Add(-time.Second)
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+		if atomic.AddInt32(&renewCalls, 1) == 1 {
+			// Initial confirmation commits, but the fast client clock cannot use
+			// the broker's absolute deadline as local retry headroom.
+			return time.Now().Add(-time.Second), nil
+		}
+		return time.Time{}, errors.New("temporary renewal failure")
+	}
+	var handlerCalls int32
+	var observed []error
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { observed = append(observed, err) }),
+	})
+	receiver.process(context.Background(), message, func(ctx context.Context, _ *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		<-ctx.Done()
+		return ctx.Err()
+	}, func(error) { t.Error("transient skew renewal failure must not stop the receiver") })
+
+	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&renewCalls); got != 2 {
+		t.Fatalf("renew calls = %d, want confirmation then one failed renewal", got)
+	}
+	if len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
+		t.Fatalf("error notifications = %v, want one ErrLockLost", observed)
+	}
+	if settles := base.settleSnapshot(); len(settles) != 0 {
+		t.Fatalf("settlements = %+v, want none after untrusted lease renewal failed", settles)
+	}
+}
+
+func TestReceiverCancelsHangingRenewAtTrustedLeaseDeadline(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(49)
+	message.LockedUntil = time.Now().Add(250 * time.Millisecond)
+	renewStarted := make(chan struct{})
+	renewCanceled := make(chan struct{})
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		atomic.AddInt32(&renewCalls, 1)
+		close(renewStarted)
+		<-ctx.Done()
+		close(renewCanceled)
+		return time.Time{}, ctx.Err()
+	}
+	observed := make(chan error, 1)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { observed <- err }),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerCanceled := make(chan struct{})
+	processDone := make(chan struct{})
+	go func() {
+		receiver.process(ctx, message, func(handlerCtx context.Context, _ *Message) error {
+			<-handlerCtx.Done()
+			close(handlerCanceled)
+			return handlerCtx.Err()
+		}, func(error) { t.Error("hanging renewal must not stop the receiver") })
+		close(processDone)
+	}()
+
+	select {
+	case <-renewStarted:
+	case <-time.After(time.Second):
+		cancel()
+		<-processDone
+		t.Fatal("trusted renewal did not start")
+	}
+	select {
+	case <-processDone:
+	case <-time.After(time.Second):
+		cancel()
+		<-processDone
+		t.Fatal("trusted hanging renewal outlived its lease deadline")
+	}
+	select {
+	case <-renewCanceled:
+	default:
+		t.Fatal("trusted hanging renewal context was not canceled")
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("trusted hanging renewal did not cancel the handler")
+	}
+	if got := atomic.LoadInt32(&renewCalls); got != 1 {
+		t.Fatalf("renew calls = %d, want 1", got)
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("error notification = %v, want ErrLockLost", err)
+		}
+	default:
+		t.Fatal("trusted hanging renewal did not report lock loss")
+	}
+	if settles := base.settleSnapshot(); len(settles) != 0 {
+		t.Fatalf("settlements = %+v, want none after hanging renewal", settles)
+	}
+}
+
+func TestReceiverCancelsHangingRenewAtUntrustedProbeTimeout(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(50)
+	message.LockedUntil = time.Now().Add(-time.Second)
+	renewStarted := make(chan struct{})
+	renewCanceled := make(chan struct{})
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		if atomic.AddInt32(&renewCalls, 1) == 1 {
+			// The synchronous dispatch gate succeeds but cannot provide a locally
+			// trustworthy deadline under persistent clock skew.
+			return time.Now().Add(-time.Second), nil
+		}
+		close(renewStarted)
+		<-ctx.Done()
+		close(renewCanceled)
+		return time.Time{}, ctx.Err()
+	}
+	observed := make(chan error, 1)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { observed <- err }),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerCanceled := make(chan struct{})
+	processDone := make(chan struct{})
+	go func() {
+		receiver.process(ctx, message, func(handlerCtx context.Context, _ *Message) error {
+			<-handlerCtx.Done()
+			close(handlerCanceled)
+			return handlerCtx.Err()
+		}, func(error) { t.Error("hanging renewal must not stop the receiver") })
+		close(processDone)
+	}()
+
+	select {
+	case <-renewStarted:
+	case <-time.After(time.Second):
+		cancel()
+		<-processDone
+		t.Fatal("untrusted renewal probe did not start")
+	}
+	select {
+	case <-processDone:
+	case <-time.After(time.Second):
+		cancel()
+		<-processDone
+		t.Fatal("untrusted hanging renewal outlived its probe timeout")
+	}
+	select {
+	case <-renewCanceled:
+	default:
+		t.Fatal("untrusted hanging renewal context was not canceled")
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("untrusted hanging renewal did not cancel the handler")
+	}
+	if got := atomic.LoadInt32(&renewCalls); got != 2 {
+		t.Fatalf("renew calls = %d, want dispatch confirmation then one probe", got)
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("error notification = %v, want ErrLockLost", err)
+		}
+	default:
+		t.Fatal("untrusted hanging renewal did not report lock loss")
+	}
+	if settles := base.settleSnapshot(); len(settles) != 0 {
+		t.Fatalf("settlements = %+v, want none after hanging renewal", settles)
+	}
 }
 
 func TestAutoRenewIntervalStaysInsideShortLease(t *testing.T) {
@@ -1780,14 +2208,15 @@ func TestReceiverRetriesRenewalThroughTransientWindow(t *testing.T) {
 	}
 }
 
-func TestReceiverRejectsUnusableCommittedRenewDeadline(t *testing.T) {
+func TestReceiverRequiresContinuedConfirmationForUnusableRenewDeadline(t *testing.T) {
 	tests := []struct {
-		name     string
-		deadline func() time.Time
+		name       string
+		deadline   func() time.Time
+		renewCalls int32
 	}{
-		{name: "zero", deadline: func() time.Time { return time.Time{} }},
-		{name: "expired", deadline: func() time.Time { return time.Now().Add(-time.Second) }},
-		{name: "inside safety window", deadline: func() time.Time { return time.Now().Add(5 * time.Millisecond) }},
+		{name: "zero", deadline: func() time.Time { return time.Time{} }, renewCalls: 2},
+		{name: "expired", deadline: func() time.Time { return time.Now().Add(-time.Second) }, renewCalls: 2},
+		{name: "inside safety window", deadline: func() time.Time { return time.Now().Add(5 * time.Millisecond) }, renewCalls: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1796,7 +2225,7 @@ func TestReceiverRejectsUnusableCommittedRenewDeadline(t *testing.T) {
 			base.receiveFn = func(ctx context.Context, _ int, _ receiveRecord) ([]*Message, error) {
 				if atomic.CompareAndSwapInt32(&delivered, 0, 1) {
 					message := base.message(30)
-					message.LockedUntil = time.Now().Add(90 * time.Millisecond)
+					message.LockedUntil = time.Now().Add(300 * time.Millisecond)
 					return []*Message{message}, nil
 				}
 				<-ctx.Done()
@@ -1837,8 +2266,8 @@ func TestReceiverRejectsUnusableCommittedRenewDeadline(t *testing.T) {
 			default:
 				t.Fatal("unusable committed deadline did not cancel handler")
 			}
-			if got := atomic.LoadInt32(&renewCalls); got != 1 {
-				t.Fatalf("deadline renewal calls = %d, want 1", got)
+			if got := atomic.LoadInt32(&renewCalls); got != test.renewCalls {
+				t.Fatalf("deadline renewal calls = %d, want %d", got, test.renewCalls)
 			}
 			if got := atomic.LoadInt32(&observed); got != 1 {
 				t.Fatalf("error notifications = %d, want one ErrLockLost", got)
