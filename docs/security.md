@@ -54,7 +54,9 @@ an intermediary strips both headers, the Receiver reports degraded clock mode
 once through its error handler, confirms ownership before dispatch, and keeps a
 bounded untrusted cadence rather than trusting the raw absolute deadline. Exact
 confirmed leases below the minimum renewal interval fail closed rather than
-producing a renewal hot loop.
+producing a renewal hot loop. Without either time header there is no relative
+lease duration to prove, so preserve one header or keep the configured lock well
+above the 250ms degraded cadence plus network latency (1s or more is recommended).
 Transient failures are retried only while the known lease is live. An untrusted
 confirmation has a separate one-second request watchdog and conservative
 cadence. Recovery is silent; confirmed loss cancels that message's handler

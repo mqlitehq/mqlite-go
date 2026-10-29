@@ -14,7 +14,8 @@
   use bounded untrusted confirmation, pathologically short exact leases fail
   closed instead of hot-looping, and a missing-header degraded mode is reported
   once through the error handler and never schedules from an untrusted raw
-  absolute deadline.
+  absolute deadline. Document that this fallback requires a lock comfortably
+  above its 250ms cadence plus network latency when both headers are stripped.
 - Retry a broker-produced HTTP 499 in managed exact-operation loops while the
   controlling context remains live. This prevents an older broker or
   intermediary cancellation response from stopping a Receiver without retrying

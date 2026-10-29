@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -388,6 +389,167 @@ func TestReceiverRetriesBrokerCanceledReceiveWithSameAttempt(t *testing.T) {
 	settles := source.settleSnapshot()
 	if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
 		t.Fatalf("settlements = %+v, want replay fence then completion", settles)
+	}
+}
+
+func TestReceiverSurvivesHTTPDrainAndRestartWithSameAttempt(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	firstAttempt := make(chan string, 1)
+	firstServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != wire.PathReceive {
+			http.NotFound(w, req)
+			return
+		}
+		var receive wire.ReceiveRequest
+		if err := json.NewDecoder(req.Body).Decode(&receive); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "unavailable", Message: "broker is draining"})
+		_ = listener.Close()
+		firstAttempt <- receive.AttemptID
+	})}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- firstServer.Serve(listener) }()
+	defer firstServer.Close()
+
+	client, err := Open(context.Background(), "http://"+address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	retryObserved := make(chan error, 1)
+	receiver := client.Receiver("jobs", WithErrorHandler(func(err error) {
+		select {
+		case retryObserved <- err:
+		default:
+		}
+	}))
+	receiver.transientBackoff = 5 * time.Millisecond
+	receiver.maxReceiveBackoff = 10 * time.Millisecond
+	receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+	var handlerCalls int32
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- receiver.Run(ctx, func(_ context.Context, message *Message) error {
+			atomic.AddInt32(&handlerCalls, 1)
+			if string(message.Body) != "after-restart" {
+				t.Errorf("handler body = %q, want after-restart", message.Body)
+			}
+			return nil
+		})
+	}()
+
+	var attemptBeforeRestart string
+	select {
+	case attemptBeforeRestart = <-firstAttempt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not reach the draining broker")
+	}
+	if attemptBeforeRestart == "" {
+		t.Fatal("draining Receive omitted receive_attempt_id")
+	}
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first HTTP listener did not stop")
+	}
+	// The first 503 is retried immediately. Wait for the following connection
+	// refusal so this covers an actual broker gap, not two handlers in one process.
+	select {
+	case <-retryObserved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not survive the between-process connection failure")
+	}
+
+	listener, err = net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("restart listener on %s: %v", address, err)
+	}
+	replayedAttempt := make(chan string, 1)
+	completed := make(chan struct{}, 1)
+	var receiveCalls int32
+	secondServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		now := time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+		switch req.URL.Path {
+		case wire.PathReceive:
+			var receive wire.ReceiveRequest
+			if err := json.NewDecoder(req.Body).Decode(&receive); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if atomic.AddInt32(&receiveCalls, 1) != 1 {
+				<-req.Context().Done()
+				return
+			}
+			replayedAttempt <- receive.AttemptID
+			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+				SeqNumber: 1, LockToken: "lock-1", DeliveryCount: 1, Body: []byte("after-restart"),
+				LockedUntilMs: now.Add(5*time.Second).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathRenewBatch:
+			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+				SeqNumber: 1, Ok: true,
+				LockedUntilMs: now.Add(5*time.Second).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathComplete:
+			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+			select {
+			case completed <- struct{}{}:
+			default:
+			}
+		default:
+			http.NotFound(w, req)
+		}
+	})}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- secondServer.Serve(listener) }()
+	defer secondServer.Close()
+
+	select {
+	case got := <-replayedAttempt:
+		if got != attemptBeforeRestart {
+			t.Fatalf("AttemptID changed across drain/restart: %q -> %q", attemptBeforeRestart, got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not reconnect after broker restart")
+	}
+	select {
+	case <-completed:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not complete the replayed message")
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want context.Canceled after test shutdown", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not stop after test cancellation")
+	}
+	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+		t.Fatalf("handler calls = %d, want one", got)
+	}
+	if err := secondServer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restarted HTTP server did not stop")
 	}
 }
 

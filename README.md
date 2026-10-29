@@ -105,6 +105,9 @@ degraded clock mode once through `WithErrorHandler`, confirms the lease before
 dispatch, and keeps using bounded untrusted confirmation instead of scheduling
 from the raw absolute `LockedUntil`. Exact leases too short to support the 50ms
 minimum renewal interval fail closed rather than hot-looping.
+The no-header fallback has no relative lease duration to prove: preserve either
+time header, or configure the lock well above its 250ms cadence plus network
+latency (1s or more is recommended).
 If no response-time sample yields a usable deadline, a successful renewal still
 releases the handler and the receiver uses a conservative confirmation cadence.
 The first later renewal failure cancels the handler because no safe retry window
