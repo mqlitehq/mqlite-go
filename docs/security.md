@@ -43,16 +43,22 @@ before a lease was lost.
 Managed renewal uses a single-item RenewBatch when available so each successful
 response supplies the committed deadline. Once an older broker reports that
 route unsupported, the receiver permanently uses legacy Renew with a
-conservative inferred deadline. Transient failures are retried only while the
-known lease is live. Recovery is silent; confirmed loss cancels that message's
-handler context and reports one `ErrLockLost`. Handlers must stop promptly when
-their context is canceled.
+conservative inferred deadline. Broker response time is translated to a local
+monotonic deadline using `X-Mqlite-Server-Time-Ms`; the standard HTTP `Date`
+header is a lower-precision fallback for older brokers. If an intermediary
+strips both headers, raw absolute deadlines again require synchronized clocks.
+Transient failures are retried only while the known lease is live. An untrusted
+confirmation has a separate one-second request watchdog and conservative
+cadence. Recovery is silent; confirmed loss cancels that message's handler
+context and reports one `ErrLockLost`. Handlers must stop promptly when their
+context is canceled.
 
 Managed Receive keeps one `receive_attempt_id` across transport backoff. This
 replays a batch already claimed by the broker instead of claiming another one.
 The first failure gets one immediate, silent replay; a second consecutive
-failure is reported and starts exponential jittered backoff. An expired replay
-is discarded before handler dispatch. Complete and Abandon then replay the exact
+failure is reported and starts exponential jittered backoff. Every replayed
+Peek-Lock batch is fenced by one broker renewal before handler dispatch, even
+when continuing auto-renew is disabled. Complete and Abandon then replay the exact
 same fenced request within a five-second bound; matching broker settlement
 receipts make a lost-response replay idempotent. A handler slot is released when
 the handler returns, while a separate total-in-flight slot remains held through

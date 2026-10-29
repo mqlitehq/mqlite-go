@@ -18,6 +18,81 @@ import (
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
 
+func TestServerTimeLeaseEstimateNeverWidensForLongPollRTT(t *testing.T) {
+	received := time.Now()
+	started := received.Add(-20 * time.Second)
+	header := make(http.Header)
+	header.Set(wire.ServerTimeHeader, fmt.Sprintf("%d", received.UnixNano()/int64(time.Millisecond)))
+	observation, ok := observeServerTime(header, started, received)
+	if !ok {
+		t.Fatal("server time observation was not parsed")
+	}
+
+	// The local wall clock makes this deadline look one second away. Charging the
+	// full long-poll RTT must instead make it unusable, forcing a broker-fenced
+	// initial renewal rather than enlarging a lease from local clock ambiguity.
+	remote := time.Now().Add(time.Second)
+	deadline, ok := observation.localLeaseDeadline(remote)
+	if !ok {
+		t.Fatal("server time observation could not map the lease")
+	}
+	if remaining := time.Until(deadline); remaining >= 0 {
+		t.Fatalf("remaining lease = %s, want conservative expired estimate", remaining)
+	}
+}
+
+func TestLeaseObservationIsScopedToProducingResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case wire.PathReceive:
+			time.Sleep(150 * time.Millisecond)
+			serverNow := time.Now().Add(-30 * time.Second)
+			w.Header().Set(wire.ServerTimeHeader, fmt.Sprintf("%d", serverNow.UnixNano()/int64(time.Millisecond)))
+			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+				SeqNumber: 1, LockToken: "lock-1",
+				LockedUntilMs: serverNow.Add(100*time.Millisecond).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathRenewBatch:
+			serverNow := time.Now().Add(-30 * time.Second)
+			w.Header().Set(wire.ServerTimeHeader, fmt.Sprintf("%d", serverNow.UnixNano()/int64(time.Millisecond)))
+			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+				SeqNumber: 1, Ok: true,
+				LockedUntilMs: serverNow.Add(200*time.Millisecond).UnixNano() / int64(time.Millisecond),
+			}}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	messages, err := client.Receive(context.Background(), "jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(messages))
+	}
+	if messages[0].localLeaseDeadline.IsZero() {
+		t.Fatal("receive response did not attach its server-time observation")
+	}
+	if remaining := time.Until(messages[0].localLeaseDeadline); remaining >= 0 {
+		t.Fatalf("long-poll lease = %s, want conservative unusable estimate", remaining)
+	}
+
+	deadline, err := client.renewLease(context.Background(), messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining := time.Until(deadline); remaining <= 100*time.Millisecond {
+		t.Fatalf("short-RTT renewal lease = %s, want its own response-scoped window above 100ms", remaining)
+	}
+}
+
 func TestParseDSNContract(t *testing.T) {
 	tests := []struct {
 		name         string

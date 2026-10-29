@@ -9,6 +9,8 @@ import (
 
 // Unary RPC paths. Every operation is one JSON HTTP POST.
 const (
+	ServerTimeHeader = "X-Mqlite-Server-Time-Ms"
+
 	PathSend            = "/mqlite.v1.QueueService/Send"
 	PathReceive         = "/mqlite.v1.QueueService/Receive"
 	PathComplete        = "/mqlite.v1.QueueService/Complete"

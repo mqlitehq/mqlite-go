@@ -23,25 +23,28 @@ func outToWire(message OutMessage) wire.Message {
 	}
 }
 
-func (c *Client) wireToMessage(queue string, message wire.Message) *Message {
+func (c *Client) wireToMessage(queue string, message wire.Message, observation serverClockObservation) *Message {
+	lockedUntil := timeFromEpochMilliseconds(message.LockedUntilMs)
+	localLeaseDeadline, _ := observation.localLeaseDeadline(lockedUntil)
 	return &Message{
-		SequenceNumber: message.SeqNumber,
-		Body:           message.Body,
-		MessageID:      message.MessageID,
-		GroupID:        message.GroupID,
-		CorrelationID:  message.CorrelationID,
-		ReplyTo:        message.ReplyTo,
-		Subject:        message.Subject,
-		ContentType:    message.ContentType,
-		Properties:     message.Properties,
-		DeliveryCount:  message.DeliveryCount,
-		EnqueuedAt:     timeFromEpochMilliseconds(message.EnqueuedAtMs),
-		VisibleAt:      timeFromEpochMilliseconds(message.VisibleAtMs),
-		ExpiresAt:      timeFromEpochMilliseconds(message.ExpiresAtMs),
-		LockedUntil:    timeFromEpochMilliseconds(message.LockedUntilMs),
-		queue:          queue,
-		lockToken:      message.LockToken,
-		s:              c,
+		SequenceNumber:     message.SeqNumber,
+		Body:               message.Body,
+		MessageID:          message.MessageID,
+		GroupID:            message.GroupID,
+		CorrelationID:      message.CorrelationID,
+		ReplyTo:            message.ReplyTo,
+		Subject:            message.Subject,
+		ContentType:        message.ContentType,
+		Properties:         message.Properties,
+		DeliveryCount:      message.DeliveryCount,
+		EnqueuedAt:         timeFromEpochMilliseconds(message.EnqueuedAtMs),
+		VisibleAt:          timeFromEpochMilliseconds(message.VisibleAtMs),
+		ExpiresAt:          timeFromEpochMilliseconds(message.ExpiresAtMs),
+		LockedUntil:        lockedUntil,
+		queue:              queue,
+		lockToken:          message.LockToken,
+		s:                  c,
+		localLeaseDeadline: localLeaseDeadline,
 	}
 }
 
@@ -236,37 +239,46 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, messages ...*M
 
 // RenewBatch renews many live locks in one statement and round trip.
 func (c *Client) RenewBatch(ctx context.Context, queue string, messages ...*Message) ([]SettleResult, error) {
+	results, _, err := c.renewBatchObserved(ctx, queue, messages...)
+	return results, err
+}
+
+func (c *Client) renewBatchObserved(ctx context.Context, queue string, messages ...*Message) ([]SettleResult, serverClockObservation, error) {
 	if len(messages) > MaxRenewBatch {
-		return nil, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)
+		return nil, serverClockObservation{}, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)
 	}
 	items, err := settleItems(messages)
 	if err != nil {
-		return nil, err
+		return nil, serverClockObservation{}, err
 	}
 	response := wire.RenewBatchResponse{}
-	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &response); err != nil {
+	observation, err := c.postObserved(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &response)
+	if err != nil {
 		var invalid *invalidSuccessResponseError
 		if errors.As(err, &invalid) {
-			return nil, &ambiguousOutcomeError{operation: "RenewBatch", cause: err}
+			return nil, serverClockObservation{}, &ambiguousOutcomeError{operation: "RenewBatch", cause: err}
 		}
-		return nil, err
+		return nil, serverClockObservation{}, err
 	}
 	if err := validateBatchResults(messages, response.Results, true); err != nil {
-		return nil, &ambiguousOutcomeError{operation: "RenewBatch", cause: err}
+		return nil, serverClockObservation{}, &ambiguousOutcomeError{operation: "RenewBatch", cause: err}
 	}
-	return settleResults(response.Results), nil
+	return settleResults(response.Results), observation, nil
 }
 
 // renewLease is the managed receiver's deadline-bearing renewal path. The
 // public single-message Renew route predates deadline responses, while
 // RenewBatch reports the committed lease deadline even for one item.
 func (c *Client) renewLease(ctx context.Context, message *Message) (time.Time, error) {
-	results, err := c.RenewBatch(ctx, message.queue, message)
+	results, observation, err := c.renewBatchObserved(ctx, message.queue, message)
 	if err != nil {
 		return time.Time{}, err
 	}
 	if len(results) != 1 || !results[0].Ok {
 		return time.Time{}, ErrLockLost
+	}
+	if deadline, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
+		return deadline, nil
 	}
 	return results[0].LockedUntil, nil
 }
@@ -279,10 +291,13 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 		return nil, fmt.Errorf("%w: receive wait cannot be negative", ErrInvalidArgument)
 	}
 	response := wire.ReceiveResponse{}
+	var observation serverClockObservation
+	var err error
 	if len(option.Pick) > 0 {
-		if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{
+		observation, err = c.postObserved(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{
 			Queue: queue, SeqNumbers: option.Pick,
-		}, &response); err != nil {
+		}, &response)
+		if err != nil {
 			return nil, err
 		}
 	} else {
@@ -290,10 +305,11 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 		if max <= 0 {
 			max = 1
 		}
-		if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+		observation, err = c.postObserved(ctx, wire.PathReceive, wire.ReceiveRequest{
 			Queue: queue, MaxMessages: max, WaitTimeMs: option.Wait.Milliseconds(),
 			ReceiveMode: int(option.mode()), AttemptID: option.Attempt,
-		}, &response); err != nil {
+		}, &response)
+		if err != nil {
 			var invalid *invalidSuccessResponseError
 			if option.mode() == receiveAndDelete && errors.As(err, &invalid) {
 				return nil, &ambiguousOutcomeError{operation: "ReceiveAtMostOnce", cause: err}
@@ -301,24 +317,25 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
-	return c.messagesFromWire(queue, response.Messages), nil
+	return c.messagesFromWire(queue, response.Messages, observation), nil
 }
 
 func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode receiveMode, attemptID string) ([]*Message, error) {
 	response := wire.ReceiveResponse{}
-	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+	observation, err := c.postObserved(ctx, wire.PathReceive, wire.ReceiveRequest{
 		Queue: queue, MaxMessages: max, WaitTimeMs: waitMs,
 		ReceiveMode: int(mode), AttemptID: attemptID,
-	}, &response); err != nil {
+	}, &response)
+	if err != nil {
 		return nil, err
 	}
-	return c.messagesFromWire(queue, response.Messages), nil
+	return c.messagesFromWire(queue, response.Messages, observation), nil
 }
 
-func (c *Client) messagesFromWire(queue string, messages []wire.Message) []*Message {
+func (c *Client) messagesFromWire(queue string, messages []wire.Message, observation serverClockObservation) []*Message {
 	out := make([]*Message, len(messages))
 	for i, message := range messages {
-		out[i] = c.wireToMessage(queue, message)
+		out[i] = c.wireToMessage(queue, message, observation)
 	}
 	return out
 }

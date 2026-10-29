@@ -93,16 +93,21 @@ was lost, the message-specific handler context is canceled and the error handler
 receives one `ErrLockLost`. Permanent authorization or resource errors retain
 their specific sentinel and stop `Run`. The configured lock duration must still
 leave enough time for the network round trip, and the application and broker
-clocks should be synchronized. If a successful renewal has no locally usable
-absolute deadline—because a legacy broker omits it or clock skew makes it appear
-elapsed—the broker acknowledgement still releases the handler; the receiver uses
-a conservative confirmation cadence and cancels the handler on the first later
-renewal failure because no safe local retry window is known. Shutdown is
-cooperative. Each background renewal request is bounded by the locally defensible
-lease window, so a stalled transport cancels the message context rather than
-running past the lease. Handlers and custom HTTP
-transports must honor request contexts, and an error handler must return promptly.
-The receiver waits for an in-flight renewal to exit before it settles the same lock token.
+clocks should still be synchronized. The receiver translates the broker's
+millisecond server-time header onto the local monotonic clock; older brokers use
+the standard HTTP `Date` header with its one-second precision charged against the
+lease. If an intermediary strips both headers, the SDK falls back to the raw
+`LockedUntil` value and synchronized clocks remain required in that degraded
+mode. If no response-time sample yields a usable deadline, a successful renewal
+still releases the handler and the receiver uses a conservative confirmation
+cadence. Its request watchdog is independent from that cadence, so normal
+cross-region RTT is not mistaken for immediate lock loss; the first later
+renewal failure still cancels the handler because no safe retry window is known.
+Shutdown is cooperative. Trusted renewal requests are bounded by the known lease
+window and untrusted confirmations use a one-second watchdog. Handlers and custom
+HTTP transports must honor request contexts, and an error handler must return
+promptly. The receiver waits for an in-flight renewal to exit before it settles
+the same lock token.
 Complete and Abandon use bounded exact-request retries so a lost broker response
 can be reconciled through the broker's settlement receipt without running the
 handler again.
@@ -215,8 +220,8 @@ history.
 MQLite delivery is at-least-once. Handlers must be idempotent. Lock tokens fence
 settlement, and managed receive retries retain the same attempt ID across
 backoff so a lost response does not claim another batch. A replay whose lease is
-already expired on the local clock is not dispatched unless auto-renew first
-confirms the token with the broker. The SDK does not follow HTTP
+already expired on the local clock is fenced by one broker renewal before
+dispatch, even when managed auto-renew is disabled. The SDK does not follow HTTP
 redirects for any RPC. Destructive queue/subscription deletion is sent at most
 once: redirects, transport failures, and gateway 5xx responses return
 `ErrOutcomeUnknown` for read-only reconciliation rather than automatic replay.

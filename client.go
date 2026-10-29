@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
@@ -71,6 +73,11 @@ type Client struct {
 	token     string
 	http      *http.Client
 	ownedHTTP bool
+}
+
+type serverClockObservation struct {
+	localAt     time.Time
+	serverUpper time.Time
 }
 
 type config struct {
@@ -262,6 +269,16 @@ func readResponseBounded(reader io.Reader, contentLength, limit int64) ([]byte, 
 }
 
 func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
+	return c.postWithObservation(ctx, path, body, out, nil)
+}
+
+func (c *Client) postObserved(ctx context.Context, path string, body interface{}, out interface{}) (serverClockObservation, error) {
+	var observation serverClockObservation
+	err := c.postWithObservation(ctx, path, body, out, &observation)
+	return observation, err
+}
+
+func (c *Client) postWithObservation(ctx context.Context, path string, body interface{}, out interface{}, observation *serverClockObservation) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -276,12 +293,18 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
+	started := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		if isLifecycleDelete(path) {
 			return fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %v", ErrOutcomeUnknown, reconcileHint(path), err)
 		}
 		return err
+	}
+	if resp.StatusCode/100 == 2 && observation != nil {
+		if observed, ok := observeServerTime(resp.Header, started, time.Now()); ok {
+			*observation = observed
+		}
 	}
 	defer resp.Body.Close()
 
@@ -348,6 +371,57 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		return &invalidSuccessResponseError{cause: err}
 	}
 	return nil
+}
+
+// observeServerTime converts broker response time into a conservative upper
+// bound for server time when the response reached us. New brokers expose epoch
+// milliseconds; older brokers fall back to HTTP's second-resolution Date. The
+// full round trip is charged as uncertainty, even though only the response leg
+// elapsed after the server generated the header.
+func observeServerTime(header http.Header, started, received time.Time) (serverClockObservation, bool) {
+	roundTrip := received.Sub(started)
+	if roundTrip < 0 {
+		return serverClockObservation{}, false
+	}
+	var serverTime time.Time
+	resolution := time.Millisecond
+	if value := header.Get(wire.ServerTimeHeader); value != "" {
+		millis, err := strconv.ParseInt(value, 10, 64)
+		if err == nil && millis > 0 {
+			serverTime = time.Unix(millis/1000, (millis%1000)*int64(time.Millisecond))
+		}
+	}
+	if serverTime.IsZero() {
+		serverDate, err := http.ParseTime(header.Get("Date"))
+		if err != nil {
+			return serverClockObservation{}, false
+		}
+		serverTime = serverDate
+		resolution = time.Second
+	}
+	return serverClockObservation{
+		localAt:     received,
+		serverUpper: serverTime.Add(resolution).Add(roundTrip),
+	}, true
+}
+
+// localLeaseDeadline translates a broker wall-clock deadline onto the local
+// monotonic clock. HTTP Date is available on old brokers, so this is a backward-
+// compatible clock-skew fallback while a millisecond protocol field is absent.
+func (observation serverClockObservation) localLeaseDeadline(remote time.Time) (time.Time, bool) {
+	if remote.IsZero() {
+		return time.Time{}, false
+	}
+	if observation.localAt.IsZero() {
+		return time.Time{}, false
+	}
+	now := time.Now()
+	age := now.Sub(observation.localAt)
+	if age < 0 {
+		return time.Time{}, false
+	}
+	remaining := remote.Sub(observation.serverUpper.Add(age))
+	return now.Add(remaining), true
 }
 
 func mapError(statusCode int, body wire.ErrorBody) error {

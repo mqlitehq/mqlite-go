@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -297,8 +298,8 @@ func TestReceiverRetryReusesAttemptIDAndCompletes(t *testing.T) {
 		t.Fatalf("error notifications = %d, want 0 after one recovered receive failure", got)
 	}
 	settles := source.settleSnapshot()
-	if len(settles) != 1 || settles[0].op != "complete" {
-		t.Fatalf("settlements = %+v", settles)
+	if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
+		t.Fatalf("settlements = %+v, want replay fence then completion", settles)
 	}
 }
 
@@ -587,14 +588,18 @@ func TestReceiverDoesNotDispatchRemainderWhenLeaseNotificationCancels(t *testing
 	}
 }
 
-func TestReceiverDiscardsStaleReceiveReplayAndStartsFreshAttempt(t *testing.T) {
+func TestReceiverFencesStaleReceiveReplayBeforeDispatch(t *testing.T) {
 	tests := []struct {
-		name     string
-		deadline func() time.Time
+		name           string
+		deadline       func() time.Time
+		wantSequence   int64
+		wantReceives   int
+		wantErrors     int32
+		wantOperations []string
 	}{
-		{name: "zero deadline", deadline: func() time.Time { return time.Time{} }},
-		{name: "expired deadline", deadline: func() time.Time { return time.Now().Add(-time.Second) }},
-		{name: "inside safety window", deadline: func() time.Time { return time.Now().Add(5 * time.Millisecond) }},
+		{name: "zero deadline", deadline: func() time.Time { return time.Time{} }, wantSequence: 2, wantReceives: 3, wantErrors: 1, wantOperations: []string{"complete"}},
+		{name: "expired deadline", deadline: func() time.Time { return time.Now().Add(-time.Second) }, wantSequence: 1, wantReceives: 2, wantOperations: []string{"renew", "complete"}},
+		{name: "inside safety window", deadline: func() time.Time { return time.Now().Add(5 * time.Millisecond) }, wantSequence: 1, wantReceives: 2, wantOperations: []string{"renew", "complete"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -631,25 +636,30 @@ func TestReceiverDiscardsStaleReceiveReplayAndStartsFreshAttempt(t *testing.T) {
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Run error = %v, want context canceled", err)
 			}
-			if got := atomic.LoadInt64(&handled); got != 2 {
-				t.Fatalf("handled sequence = %d, want only fresh message 2", got)
+			if got := atomic.LoadInt64(&handled); got != test.wantSequence {
+				t.Fatalf("handled sequence = %d, want %d", got, test.wantSequence)
 			}
 			receives := source.receiveSnapshot()
-			if len(receives) != 3 {
-				t.Fatalf("receive calls = %+v, want failed attempt, replay, then fresh attempt", receives)
+			if len(receives) != test.wantReceives {
+				t.Fatalf("receive calls = %+v, want %d", receives, test.wantReceives)
 			}
 			if receives[0].attemptID == "" || receives[0].attemptID != receives[1].attemptID {
 				t.Fatalf("replay attempt IDs = %q / %q, want equal non-empty IDs", receives[0].attemptID, receives[1].attemptID)
 			}
-			if receives[2].attemptID == receives[0].attemptID {
+			if len(receives) > 2 && receives[2].attemptID == receives[0].attemptID {
 				t.Fatalf("fresh receive reused stale attempt ID %q", receives[2].attemptID)
 			}
-			if got := atomic.LoadInt32(&observed); got != 1 {
-				t.Fatalf("error notifications = %d, want one stale replay notification", got)
+			if got := atomic.LoadInt32(&observed); got != test.wantErrors {
+				t.Fatalf("error notifications = %d, want %d", got, test.wantErrors)
 			}
 			settles := source.settleSnapshot()
-			if len(settles) != 1 || settles[0].op != "complete" || settles[0].seq != 2 {
-				t.Fatalf("settlements = %+v, want only fresh message completed", settles)
+			if len(settles) != len(test.wantOperations) {
+				t.Fatalf("settlements = %+v, want operations %v", settles, test.wantOperations)
+			}
+			for i, operation := range test.wantOperations {
+				if settles[i].op != operation || settles[i].seq != test.wantSequence {
+					t.Fatalf("settlements = %+v, want operations %v for sequence %d", settles, test.wantOperations, test.wantSequence)
+				}
 			}
 		})
 	}
@@ -1568,6 +1578,305 @@ func TestReceiverAutoRenewUsesConfirmedLeaseWhenClientClockIsAhead(t *testing.T)
 	}
 }
 
+func TestReceiverUntrustedLeaseAllowsNetworkRTTAboveCadence(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(52)
+	message.LockedUntil = time.Now().Add(-time.Second)
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		atomic.AddInt32(&renewCalls, 1)
+		timer := time.NewTimer(150 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-timer.C:
+			// The broker renews successfully, but its absolute deadline remains
+			// unusable according to the client's fast wall clock.
+			return time.Now().Add(-time.Second), nil
+		}
+	}
+	var observed int32
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(error) { atomic.AddInt32(&observed, 1) }),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerCompleted := make(chan struct{})
+	receiver.process(ctx, message, func(handlerCtx context.Context, _ *Message) error {
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-handlerCtx.Done():
+			return handlerCtx.Err()
+		case <-timer.C:
+			close(handlerCompleted)
+			return nil
+		}
+	}, func(error) { t.Error("transient skew renewal must not stop the receiver") })
+
+	select {
+	case <-handlerCompleted:
+	default:
+		t.Fatal("ordinary network RTT canceled the handler")
+	}
+	if got := atomic.LoadInt32(&renewCalls); got < 2 {
+		t.Fatalf("renew calls = %d, want initial confirmation plus managed renewal", got)
+	}
+	if got := atomic.LoadInt32(&observed); got != 0 {
+		t.Fatalf("error notifications = %d, want 0", got)
+	}
+	settles := base.settleSnapshot()
+	if len(settles) != 1 || settles[0].op != "complete" || settles[0].seq != 52 {
+		t.Fatalf("settlements = %+v, want completed message", settles)
+	}
+}
+
+func TestReceiverUntrustedLeaseRenewalDoesNotSpin(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(54)
+	message.LockedUntil = time.Now().Add(-time.Second)
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+		atomic.AddInt32(&renewCalls, 1)
+		return time.Now().Add(-time.Second), nil
+	}
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew()})
+	receiver.process(context.Background(), message, func(context.Context, *Message) error {
+		time.Sleep(800 * time.Millisecond)
+		return nil
+	}, func(error) { t.Error("untrusted renewal must not stop the receiver") })
+	if got := atomic.LoadInt32(&renewCalls); got < 2 || got > 4 {
+		t.Fatalf("renew calls = %d, want initial confirmation and at most three paced renewals", got)
+	}
+	settles := base.settleSnapshot()
+	if len(settles) != 1 || settles[0].op != "complete" {
+		t.Fatalf("settlements = %+v, want completion", settles)
+	}
+}
+
+func TestReceiverShortTrustedLeaseRenewsBeforeDeadline(t *testing.T) {
+	var renewCalls int32
+	var receiveCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		now := time.Now()
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+		switch req.URL.Path {
+		case wire.PathReceive:
+			if atomic.AddInt32(&receiveCalls, 1) > 1 {
+				<-req.Context().Done()
+				return
+			}
+			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+				SeqNumber: 55, LockToken: "lock-55",
+				LockedUntilMs: now.Add(40*time.Millisecond).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathRenewBatch:
+			atomic.AddInt32(&renewCalls, 1)
+			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+				SeqNumber: 55, Ok: true,
+				LockedUntilMs: now.Add(40*time.Millisecond).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathComplete:
+			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	receiver := client.Receiver("jobs", WithAutoRenew(), WithErrorHandler(func(err error) {
+		t.Errorf("short trusted lease renewal: %v", err)
+	}))
+	err = receiver.Run(ctx, func(context.Context, *Message) error {
+		time.Sleep(120 * time.Millisecond)
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&renewCalls); got < 2 || got > 20 {
+		t.Fatalf("renew calls = %d, want repeated bounded renewal for a real 40ms lease", got)
+	}
+}
+
+func TestReceiverBoundsInitialRenewalAttempt(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(53)
+	message.LockedUntil = time.Now().Add(-time.Second)
+	renewCanceled := make(chan struct{})
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		<-ctx.Done()
+		close(renewCanceled)
+		return time.Time{}, ctx.Err()
+	}
+	observed := make(chan error, 1)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { observed <- err }),
+	})
+	receiver.renewAttemptTimeout = 50 * time.Millisecond
+	var handlerCalls int32
+	done := make(chan struct{})
+	go func() {
+		receiver.process(context.Background(), message, func(context.Context, *Message) error {
+			atomic.AddInt32(&handlerCalls, 1)
+			return nil
+		}, func(error) { t.Error("initial renewal timeout must not stop the receiver") })
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("initial renewal outlived its watchdog")
+	}
+	select {
+	case <-renewCanceled:
+	default:
+		t.Fatal("initial renewal context was not canceled")
+	}
+	if got := atomic.LoadInt32(&handlerCalls); got != 0 {
+		t.Fatalf("handler calls = %d, want 0", got)
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("error notification = %v, want ErrLockLost", err)
+		}
+	default:
+		t.Fatal("initial renewal timeout was not reported")
+	}
+}
+
+func TestReceiverReplayInitialRenewalUsesMappedLeaseBudget(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(56)
+	message.LockedUntil = time.Now().Add(10 * time.Second)
+	message.localLeaseDeadline = time.Now().Add(10 * time.Second)
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		timer := time.NewTimer(1100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-timer.C:
+			return time.Now().Add(10 * time.Second), nil
+		}
+	}
+	receiver := newReceiver(source, "jobs", nil)
+	var handlerCalls int32
+	receiver.processWithHandlerRelease(context.Background(), message, func(context.Context, *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		return nil
+	}, func() {}, func(error) { t.Error("successful replay fence must not stop the receiver") }, true)
+	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+		t.Fatalf("handler calls = %d, want 1 after slow replay fence", got)
+	}
+	settles := base.settleSnapshot()
+	if len(settles) != 1 || settles[0].op != "complete" {
+		t.Fatalf("settlements = %+v, want completion", settles)
+	}
+}
+
+func TestReceiverCapsMappedInitialRenewalBudget(t *testing.T) {
+	receiver := newReceiver(&fakeReceiveSource{}, "jobs", nil)
+	ctx, cancel := receiver.initialRenewalAttemptContext(context.Background(), time.Now().Add(time.Hour))
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("initial renewal context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining < maxInitialRenewAttemptTimeout-100*time.Millisecond || remaining > maxInitialRenewAttemptTimeout {
+		t.Fatalf("initial renewal budget = %s, want at most %s", remaining, maxInitialRenewAttemptTimeout)
+	}
+}
+
+func TestReceiverUsesServerTimeForSkewedLeaseCadence(t *testing.T) {
+	tests := []struct {
+		name      string
+		setHeader func(http.Header, time.Time)
+	}{
+		{
+			name: "millisecond broker header",
+			setHeader: func(header http.Header, serverNow time.Time) {
+				header.Set(wire.ServerTimeHeader, strconv.FormatInt(serverNow.UnixNano()/int64(time.Millisecond), 10))
+			},
+		},
+		{
+			name: "legacy HTTP Date",
+			setHeader: func(header http.Header, serverNow time.Time) {
+				header.Set("Date", serverNow.UTC().Format(http.TimeFormat))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var renewCalls int32
+			var receiveCalls int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				serverNow := time.Now().Add(-30 * time.Second)
+				test.setHeader(w.Header(), serverNow)
+				switch req.URL.Path {
+				case wire.PathReceive:
+					if atomic.AddInt32(&receiveCalls, 1) > 1 {
+						<-req.Context().Done()
+						return
+					}
+					_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+						SeqNumber: 1, LockToken: "lock-1",
+						// This is only 20ms ahead on the local wall clock, but about
+						// 30s ahead according to the broker clock in the response.
+						LockedUntilMs: time.Now().Add(20*time.Millisecond).UnixNano() / int64(time.Millisecond),
+					}}})
+				case wire.PathRenewBatch:
+					atomic.AddInt32(&renewCalls, 1)
+					_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+						SeqNumber: 1, Ok: true,
+						LockedUntilMs: time.Now().Add(20*time.Millisecond).UnixNano() / int64(time.Millisecond),
+					}}})
+				case wire.PathComplete:
+					_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			receiver := client.Receiver("jobs", WithAutoRenew())
+			err = receiver.Run(ctx, func(context.Context, *Message) error {
+				time.Sleep(500 * time.Millisecond)
+				cancel()
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error = %v, want context.Canceled", err)
+			}
+			if got := atomic.LoadInt32(&renewCalls); got != 0 {
+				t.Fatalf("RenewBatch calls = %d, want 0 with server-relative lease", got)
+			}
+		})
+	}
+}
+
 func TestReceiverAutoRenewFencesEveryAttemptReplay(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1867,6 +2176,7 @@ func TestReceiverCancelsHangingRenewAtUntrustedProbeTimeout(t *testing.T) {
 		WithAutoRenew(),
 		WithErrorHandler(func(err error) { observed <- err }),
 	})
+	receiver.renewAttemptTimeout = 50 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	handlerCanceled := make(chan struct{})
@@ -2351,6 +2661,7 @@ func TestReceiverUsesRenewBatchDeadline(t *testing.T) {
 	var renewCalls int32
 	renewed := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
 		switch req.URL.Path {
 		case wire.PathReceive:
 			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
@@ -2409,6 +2720,7 @@ func TestReceiverRetriesInvalidRenewBatchAcknowledgement(t *testing.T) {
 	var renewCalls int32
 	renewed := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
 		switch req.URL.Path {
 		case wire.PathReceive:
 			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{

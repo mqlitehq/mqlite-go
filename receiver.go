@@ -18,8 +18,10 @@ const (
 )
 
 const (
-	leaseDeadlineSafety       = 10 * time.Millisecond
-	uncertainLeaseRenewPeriod = 100 * time.Millisecond
+	leaseDeadlineSafety           = 10 * time.Millisecond
+	uncertainLeaseRenewPeriod     = 250 * time.Millisecond
+	defaultRenewAttemptTimeout    = time.Second
+	maxInitialRenewAttemptTimeout = 5 * time.Second
 )
 
 type receiveSource interface {
@@ -81,6 +83,7 @@ type Receiver struct {
 	settleBackoff         time.Duration
 	maxSettleBackoff      time.Duration
 	settleTimeout         time.Duration
+	renewAttemptTimeout   time.Duration
 	jitter                func(time.Duration) time.Duration
 	renewCapabilityMu     sync.Mutex
 	renewBatchUnsupported bool
@@ -97,17 +100,18 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 		cfg.concurrency = 1
 	}
 	return &Receiver{
-		src:               src,
-		queue:             queue,
-		cfg:               cfg,
-		transientBackoff:  500 * time.Millisecond,
-		maxReceiveBackoff: 10 * time.Second,
-		renewRetryBackoff: 100 * time.Millisecond,
-		maxRenewBackoff:   time.Second,
-		settleBackoff:     100 * time.Millisecond,
-		maxSettleBackoff:  time.Second,
-		settleTimeout:     5 * time.Second,
-		jitter:            jitterBackoff,
+		src:                 src,
+		queue:               queue,
+		cfg:                 cfg,
+		transientBackoff:    500 * time.Millisecond,
+		maxReceiveBackoff:   10 * time.Second,
+		renewRetryBackoff:   100 * time.Millisecond,
+		maxRenewBackoff:     time.Second,
+		settleBackoff:       100 * time.Millisecond,
+		maxSettleBackoff:    time.Second,
+		settleTimeout:       5 * time.Second,
+		renewAttemptTimeout: defaultRenewAttemptTimeout,
+		jitter:              jitterBackoff,
 	}
 }
 
@@ -353,10 +357,8 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 
 		valid := messages[:0]
 		unusable := 0
-		cutoff := time.Now().Add(leaseDeadlineSafety)
 		for _, message := range messages {
-			if message == nil || message.LockedUntil.IsZero() ||
-				(hadTransientFailure && !r.cfg.autoRenew && !message.LockedUntil.After(cutoff)) {
+			if message == nil || message.LockedUntil.IsZero() {
 				unusable++
 				continue
 			}
@@ -401,60 +403,75 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	var cancelRenew context.CancelFunc
 	var renewDone chan error
 	var renewErr error
-	if r.cfg.autoRenew {
-		deadline, leaseLength := anchorLeaseDeadline(message.LockedUntil)
-		if forceInitialRenewal {
-			// A replayed attempt may be stale even when client clock skew makes its
-			// wire deadline look far in the future. Do not let that untrusted value
-			// become the lease estimate for a legacy Renew fallback. A successful
-			// deadline-bearing renewal below can establish a new trusted horizon.
+	deadline, leaseLength := messageLeaseDeadline(message)
+	initialAttemptDeadline := time.Time{}
+	if forceInitialRenewal {
+		// A response replay still needs a broker fence even when the response
+		// carries a usable server-time-derived local deadline. Keep that deadline
+		// only as the watchdog for this first RPC: a valid lease may allow a remote
+		// backend more than the generic 1s fallback to answer.
+		if !message.localLeaseDeadline.IsZero() && time.Until(message.localLeaseDeadline) > leaseDeadlineSafety {
+			initialAttemptDeadline = message.localLeaseDeadline
+		}
+		// A replayed attempt may be stale even when client clock skew makes its
+		// wire deadline look far in the future. Do not let that untrusted value
+		// become the lease estimate for a legacy Renew fallback. A successful
+		// deadline-bearing renewal below can establish a new trusted horizon.
+		deadline = time.Time{}
+		leaseLength = 0
+	}
+	if leaseLength <= 0 {
+		leaseLength = 0
+	}
+	if forceInitialRenewal || (r.cfg.autoRenew && leaseLength <= leaseDeadlineSafety) {
+		if ctx.Err() != nil {
+			return
+		}
+		// A replayed or locally unsafe lease cannot authorize user work. Confirm
+		// it synchronously before dispatch. The request watchdog is deliberately
+		// independent of the untrusted renewal cadence: ordinary cross-region RTT
+		// must not look like a lost lock, while a hung transport remains bounded.
+		attemptCtx, cancelAttempt := r.initialRenewalAttemptContext(ctx, initialAttemptDeadline)
+		until, err := r.renewMessage(attemptCtx, message, leaseLength)
+		attemptErr := attemptCtx.Err()
+		cancelAttempt()
+		if ctx.Err() != nil {
+			return
+		}
+		if attemptErr != nil {
+			r.loseLease(cancelHandler, attemptErr)
+			return
+		}
+		if err != nil {
+			if !retryableRenewError(err) {
+				if permanentReceiverError(err) {
+					cancelHandler()
+					r.settleError(err, fail)
+					return
+				}
+				r.loseLease(cancelHandler, err)
+				return
+			}
+			// There is no trustworthy lease window in which to back off. Match
+			// renewLoop's fail-closed classification rather than dispatching work
+			// under a token the broker may already have reassigned.
+			r.loseLease(cancelHandler, ErrLockLost)
+			return
+		}
+		confirmedDeadline, remaining := anchorLeaseDeadline(until)
+		if remaining > leaseDeadlineSafety {
+			deadline = confirmedDeadline
+			leaseLength = remaining
+		} else {
+			// A successful renewal is authoritative proof that the broker still
+			// owns this token even when clock skew makes its absolute deadline
+			// unusable locally, or a legacy Renew reports no deadline. Keep that
+			// proof separate from the local schedule.
 			deadline = time.Time{}
 			leaseLength = 0
 		}
-		if leaseLength <= 0 {
-			leaseLength = 0
-		}
-		if forceInitialRenewal || leaseLength <= leaseDeadlineSafety {
-			if ctx.Err() != nil {
-				return
-			}
-			// A locally expired or nearly expired initial lease cannot authorize
-			// user work. Confirm it synchronously before dispatch so a fast handler
-			// cannot return and cancel the first renewal before it even starts.
-			until, err := r.renewMessage(ctx, message, leaseLength)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if !retryableRenewError(err) {
-					if permanentReceiverError(err) {
-						cancelHandler()
-						r.settleError(err, fail)
-						return
-					}
-					r.loseLease(cancelHandler, err)
-					return
-				}
-				// There is no safe lease window left in which to back off and
-				// retry. Match renewLoop's exhausted-headroom classification.
-				r.loseLease(cancelHandler, ErrLockLost)
-				return
-			}
-			confirmedDeadline, remaining := anchorLeaseDeadline(until)
-			if remaining > leaseDeadlineSafety {
-				deadline = confirmedDeadline
-				leaseLength = remaining
-			} else {
-				// A successful renewal is authoritative proof that the broker still
-				// owns this token even when clock skew makes its absolute deadline
-				// unusable locally, or a legacy Renew reports no deadline. Keep that
-				// proof separate from the local schedule. Without known headroom, the
-				// renew loop uses a conservative cadence and cancels on its first
-				// renewal failure.
-				deadline = time.Time{}
-				leaseLength = 0
-			}
-		}
+	}
+	if r.cfg.autoRenew {
 		if ctx.Err() != nil {
 			return
 		}
@@ -574,16 +591,37 @@ func anchorLeaseDeadline(remote time.Time) (time.Time, time.Duration) {
 	return now.Add(remaining), remaining
 }
 
-func renewalAttemptContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+func messageLeaseDeadline(message *Message) (time.Time, time.Duration) {
+	if !message.localLeaseDeadline.IsZero() {
+		return message.localLeaseDeadline, time.Until(message.localLeaseDeadline)
+	}
+	return anchorLeaseDeadline(message.LockedUntil)
+}
+
+func (r *Receiver) renewalAttemptContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
 	if deadline.IsZero() {
-		// The broker confirmed ownership but supplied no locally usable retry
-		// window. Bound each probe to one conservative cadence so a hung HTTP
-		// exchange cannot leave the handler running indefinitely.
-		return context.WithTimeout(parent, uncertainLeaseRenewPeriod)
+		// Scheduling cadence and request timeout serve different purposes. Keep
+		// probes sparse enough to protect the broker, but allow ordinary public or
+		// cross-region RTT before deciding that the lease can no longer be proven.
+		return context.WithTimeout(parent, r.renewAttemptTimeout)
 	}
 	// Stop the RPC before the last safety margin is spent. deadline was
 	// re-anchored onto Go's monotonic clock when it entered the renewal state.
 	return context.WithDeadline(parent, deadline.Add(-leaseDeadlineSafety))
+}
+
+func (r *Receiver) initialRenewalAttemptContext(parent context.Context, trustedDeadline time.Time) (context.Context, context.CancelFunc) {
+	if trustedDeadline.IsZero() {
+		return context.WithTimeout(parent, r.renewAttemptTimeout)
+	}
+	budget := time.Until(trustedDeadline) - leaseDeadlineSafety
+	if budget <= 0 {
+		return context.WithTimeout(parent, r.renewAttemptTimeout)
+	}
+	if budget > maxInitialRenewAttemptTimeout {
+		budget = maxInitialRenewAttemptTimeout
+	}
+	return context.WithTimeout(parent, budget)
 }
 
 const minimumRenewRetryHeadroom = 5 * time.Millisecond
@@ -669,7 +707,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			return nil
 		}
 
-		renewCtx, cancelRenew := renewalAttemptContext(ctx, deadline)
+		renewCtx, cancelRenew := r.renewalAttemptContext(ctx, deadline)
 		until, err := r.renewMessage(renewCtx, message, leaseLength)
 		attemptErr := renewCtx.Err()
 		cancelRenew()
