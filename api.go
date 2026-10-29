@@ -25,26 +25,29 @@ func outToWire(message OutMessage) wire.Message {
 
 func (c *Client) wireToMessage(queue string, message wire.Message, observation serverClockObservation) *Message {
 	lockedUntil := timeFromEpochMilliseconds(message.LockedUntilMs)
-	localLeaseDeadline, _ := observation.localLeaseDeadline(lockedUntil)
+	localLeaseDeadline, observedClock := observation.localLeaseDeadline(lockedUntil)
 	return &Message{
-		SequenceNumber:     message.SeqNumber,
-		Body:               message.Body,
-		MessageID:          message.MessageID,
-		GroupID:            message.GroupID,
-		CorrelationID:      message.CorrelationID,
-		ReplyTo:            message.ReplyTo,
-		Subject:            message.Subject,
-		ContentType:        message.ContentType,
-		Properties:         message.Properties,
-		DeliveryCount:      message.DeliveryCount,
-		EnqueuedAt:         timeFromEpochMilliseconds(message.EnqueuedAtMs),
-		VisibleAt:          timeFromEpochMilliseconds(message.VisibleAtMs),
-		ExpiresAt:          timeFromEpochMilliseconds(message.ExpiresAtMs),
-		LockedUntil:        lockedUntil,
-		queue:              queue,
-		lockToken:          message.LockToken,
-		s:                  c,
-		localLeaseDeadline: localLeaseDeadline,
+		SequenceNumber:        message.SeqNumber,
+		Body:                  message.Body,
+		MessageID:             message.MessageID,
+		GroupID:               message.GroupID,
+		CorrelationID:         message.CorrelationID,
+		ReplyTo:               message.ReplyTo,
+		Subject:               message.Subject,
+		ContentType:           message.ContentType,
+		Properties:            message.Properties,
+		DeliveryCount:         message.DeliveryCount,
+		EnqueuedAt:            timeFromEpochMilliseconds(message.EnqueuedAtMs),
+		VisibleAt:             timeFromEpochMilliseconds(message.VisibleAtMs),
+		ExpiresAt:             timeFromEpochMilliseconds(message.ExpiresAtMs),
+		LockedUntil:           lockedUntil,
+		queue:                 queue,
+		lockToken:             message.LockToken,
+		s:                     c,
+		localLeaseDeadline:    localLeaseDeadline,
+		leaseResponseRTT:      observation.responseRTT,
+		leaseClockResolution:  observation.resolution,
+		leaseClockUnavailable: !lockedUntil.IsZero() && !observedClock,
 	}
 }
 
@@ -269,18 +272,25 @@ func (c *Client) renewBatchObserved(ctx context.Context, queue string, messages 
 // renewLease is the managed receiver's deadline-bearing renewal path. The
 // public single-message Renew route predates deadline responses, while
 // RenewBatch reports the committed lease deadline even for one item.
-func (c *Client) renewLease(ctx context.Context, message *Message) (time.Time, error) {
+func (c *Client) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
 	results, observation, err := c.renewBatchObserved(ctx, message.queue, message)
 	if err != nil {
-		return time.Time{}, err
+		return renewalLease{}, err
 	}
 	if len(results) != 1 || !results[0].Ok {
-		return time.Time{}, ErrLockLost
+		return renewalLease{}, ErrLockLost
+	}
+	lease := renewalLease{
+		responseRTT:      observation.responseRTT,
+		clockResolution:  observation.resolution,
+		clockUnavailable: observation.serverUpper.IsZero(),
 	}
 	if deadline, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
-		return deadline, nil
+		lease.deadline = deadline
+		return lease, nil
 	}
-	return results[0].LockedUntil, nil
+	lease.deadline = results[0].LockedUntil
+	return lease, nil
 }
 
 // Receive claims messages with Peek-Lock by default. Pick retrieves deferred

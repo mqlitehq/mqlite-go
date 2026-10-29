@@ -92,17 +92,23 @@ transient failure exhausts the known lease, or the broker reports that the lock
 was lost, the message-specific handler context is canceled and the error handler
 receives one `ErrLockLost`. Permanent authorization or resource errors retain
 their specific sentinel and stop `Run`. The configured lock duration must still
-leave enough time for the network round trip, and the application and broker
-clocks should still be synchronized. The receiver translates the broker's
-millisecond server-time header onto the local monotonic clock; older brokers use
-the standard HTTP `Date` header with its one-second precision charged against the
-lease. If an intermediary strips both headers, the SDK falls back to the raw
-`LockedUntil` value and synchronized clocks remain required in that degraded
-mode. If no response-time sample yields a usable deadline, a successful renewal
-still releases the handler and the receiver uses a conservative confirmation
-cadence. Its request watchdog is independent from that cadence, so normal
-cross-region RTT is not mistaken for immediate lock loss; the first later
-renewal failure still cancels the handler because no safe retry window is known.
+leave enough time for the network round trip. The receiver translates the
+broker's millisecond server-time header onto the local monotonic clock and uses
+measured response RTT to start renewal early; an exact mapped lease horizon
+that is still outside the safety window remains the hard request watchdog. A
+conservative lower bound already consumed by a long poll gets one bounded
+confirmation before dispatch. Older brokers use the standard HTTP `Date` header.
+Its one-second precision is charged against the lease, and a coarse
+horizon that cannot safely fit that precision plus measured RTT uses bounded
+untrusted confirmation. If an intermediary strips both headers, the SDK reports
+degraded clock mode once through `WithErrorHandler`, confirms the lease before
+dispatch, and keeps using bounded untrusted confirmation instead of scheduling
+from the raw absolute `LockedUntil`. Exact leases too short to support the 50ms
+minimum renewal interval fail closed rather than hot-looping.
+If no response-time sample yields a usable deadline, a successful renewal still
+releases the handler and the receiver uses a conservative confirmation cadence.
+The first later renewal failure cancels the handler because no safe retry window
+is known.
 Shutdown is cooperative. Trusted renewal requests are bounded by the known lease
 window and untrusted confirmations use a one-second watchdog. Handlers and custom
 HTTP transports must honor request contexts, and an error handler must return
@@ -111,6 +117,10 @@ the same lock token.
 Complete and Abandon use bounded exact-request retries so a lost broker response
 can be reconciled through the broker's settlement receipt without running the
 handler again.
+When a broker or intermediary returns HTTP 499 for a managed request, the
+Receiver treats that response as transient only while its own controlling
+context remains live. Receive reuses the same attempt ID; canceling the caller
+context never triggers another request.
 
 ## Topics and subscriptions
 
@@ -235,6 +245,8 @@ acknowledgement for AtMostOnce Receive is also outcome-unknown because
 receive-and-delete may have removed messages. Peek-Lock Receive remains
 replayable with the same attempt ID. The managed receiver replays only exact
 fenced renewal, Complete, or Abandon requests within its retry budget.
+HTTP 499 from a broker or intermediary is retryable in these managed loops only
+while their controlling context remains live; caller cancellation is not replayed.
 
 `Receiver.Run` always uses Peek-Lock and replays an identical Complete or
 Abandon request for up to five seconds after a retryable failure. A process

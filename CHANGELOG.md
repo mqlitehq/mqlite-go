@@ -8,9 +8,17 @@
   once ownership can no longer be confirmed.
 - Translate broker response time (`X-Mqlite-Server-Time-Ms`, with HTTP `Date` as
   an older-broker fallback) into a conservative local monotonic lease deadline.
-  Renewal request watchdogs are independent from renewal cadence, so ordinary
-  cross-region RTT does not cancel every skewed-clock delivery; initial lease
-  confirmation is bounded as well.
+  Measured response RTT starts renewal early without extending a still-usable
+  exact mapped lease watchdog. An already-expired conservative long-poll lower
+  bound gets one bounded confirmation before dispatch. Coarse `Date` horizons
+  use bounded untrusted confirmation, pathologically short exact leases fail
+  closed instead of hot-looping, and a missing-header degraded mode is reported
+  once through the error handler and never schedules from an untrusted raw
+  absolute deadline.
+- Retry a broker-produced HTTP 499 in managed exact-operation loops while the
+  controlling context remains live. This prevents an older broker or
+  intermediary cancellation response from stopping a Receiver without retrying
+  caller cancellation, and Receive retains the same attempt ID.
 - Fence a replayed receive with one broker renewal even when managed auto-renew
   is disabled. This avoids discarding a broker-valid lease solely because the
   client wall clock is ahead.

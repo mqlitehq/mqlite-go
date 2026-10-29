@@ -44,9 +44,17 @@ Managed renewal uses a single-item RenewBatch when available so each successful
 response supplies the committed deadline. Once an older broker reports that
 route unsupported, the receiver permanently uses legacy Renew with a
 conservative inferred deadline. Broker response time is translated to a local
-monotonic deadline using `X-Mqlite-Server-Time-Ms`; the standard HTTP `Date`
-header is a lower-precision fallback for older brokers. If an intermediary
-strips both headers, raw absolute deadlines again require synchronized clocks.
+monotonic deadline using `X-Mqlite-Server-Time-Ms`; measured response RTT starts
+renewal earlier but never extends a still-usable exact mapped ownership horizon.
+An already-expired conservative long-poll lower bound gets one bounded
+confirmation before dispatch. The standard HTTP `Date` header is a
+lower-precision fallback for older brokers. A coarse horizon that cannot fit its
+one-second precision plus measured RTT uses bounded untrusted confirmation. If
+an intermediary strips both headers, the Receiver reports degraded clock mode
+once through its error handler, confirms ownership before dispatch, and keeps a
+bounded untrusted cadence rather than trusting the raw absolute deadline. Exact
+confirmed leases below the minimum renewal interval fail closed rather than
+producing a renewal hot loop.
 Transient failures are retried only while the known lease is live. An untrusted
 confirmation has a separate one-second request watchdog and conservative
 cadence. Recovery is silent; confirmed loss cancels that message's handler
@@ -55,6 +63,9 @@ context is canceled.
 
 Managed Receive keeps one `receive_attempt_id` across transport backoff. This
 replays a batch already claimed by the broker instead of claiming another one.
+An HTTP 499 response produced by a broker or intermediary is retryable in this
+managed loop only while the Receiver's controlling context remains live; caller
+cancellation is never replayed.
 The first failure gets one immediate, silent replay; a second consecutive
 failure is reported and starts exponential jittered backoff. Every replayed
 Peek-Lock batch is fenced by one broker renewal before handler dispatch, even

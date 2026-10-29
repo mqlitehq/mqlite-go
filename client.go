@@ -78,6 +78,8 @@ type Client struct {
 type serverClockObservation struct {
 	localAt     time.Time
 	serverUpper time.Time
+	responseRTT time.Duration
+	resolution  time.Duration
 }
 
 type config struct {
@@ -302,9 +304,12 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 		return err
 	}
 	if resp.StatusCode/100 == 2 && observation != nil {
-		if observed, ok := observeServerTime(resp.Header, started, time.Now()); ok {
-			*observation = observed
-		}
+		observed, _ := observeServerTime(resp.Header, started, time.Now())
+		// Even when neither clock header survived an intermediary, retain the
+		// response timestamp and measured RTT. localLeaseDeadline still refuses to
+		// map without serverUpper, while the Receiver can diagnose and enter its
+		// bounded untrusted schedule.
+		*observation = observed
 	}
 	defer resp.Body.Close()
 
@@ -381,7 +386,7 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 func observeServerTime(header http.Header, started, received time.Time) (serverClockObservation, bool) {
 	roundTrip := received.Sub(started)
 	if roundTrip < 0 {
-		return serverClockObservation{}, false
+		roundTrip = 0
 	}
 	var serverTime time.Time
 	resolution := time.Millisecond
@@ -394,7 +399,11 @@ func observeServerTime(header http.Header, started, received time.Time) (serverC
 	if serverTime.IsZero() {
 		serverDate, err := http.ParseTime(header.Get("Date"))
 		if err != nil {
-			return serverClockObservation{}, false
+			// Preserve the measured RTT even when an intermediary stripped both
+			// clock headers. The managed Receiver cannot map the absolute lease in
+			// this mode, but it can still retain transport diagnostics and must not
+			// silently treat the raw broker timestamp as a local deadline.
+			return serverClockObservation{localAt: received, responseRTT: roundTrip}, false
 		}
 		serverTime = serverDate
 		resolution = time.Second
@@ -402,6 +411,8 @@ func observeServerTime(header http.Header, started, received time.Time) (serverC
 	return serverClockObservation{
 		localAt:     received,
 		serverUpper: serverTime.Add(resolution).Add(roundTrip),
+		responseRTT: roundTrip,
+		resolution:  resolution,
 	}, true
 }
 
@@ -412,7 +423,7 @@ func (observation serverClockObservation) localLeaseDeadline(remote time.Time) (
 	if remote.IsZero() {
 		return time.Time{}, false
 	}
-	if observation.localAt.IsZero() {
+	if observation.localAt.IsZero() || observation.serverUpper.IsZero() {
 		return time.Time{}, false
 	}
 	now := time.Now()

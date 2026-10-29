@@ -84,11 +84,11 @@ func TestLeaseObservationIsScopedToProducingResponse(t *testing.T) {
 		t.Fatalf("long-poll lease = %s, want conservative unusable estimate", remaining)
 	}
 
-	deadline, err := client.renewLease(context.Background(), messages[0])
+	lease, err := client.renewLease(context.Background(), messages[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remaining := time.Until(deadline); remaining <= 100*time.Millisecond {
+	if remaining := time.Until(lease.deadline); remaining <= 100*time.Millisecond {
 		t.Fatalf("short-RTT renewal lease = %s, want its own response-scoped window above 100ms", remaining)
 	}
 }

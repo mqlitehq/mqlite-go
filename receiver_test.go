@@ -66,19 +66,30 @@ type concurrentLeaseSource struct {
 
 type deadlineLeaseSource struct {
 	*fakeReceiveSource
-	renewLeaseFn func(context.Context, *Message) (time.Time, error)
+	renewLeaseFn   func(context.Context, *Message) (time.Time, error)
+	renewalLeaseFn func(context.Context, *Message) (renewalLease, error)
 }
 
-func (s *deadlineLeaseSource) renewLease(ctx context.Context, message *Message) (time.Time, error) {
-	return s.renewLeaseFn(ctx, message)
+func (s *deadlineLeaseSource) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
+	if s.renewalLeaseFn != nil {
+		return s.renewalLeaseFn(ctx, message)
+	}
+	deadline, err := s.renewLeaseFn(ctx, message)
+	return renewalLease{
+		deadline:          deadline,
+		responseRTT:       message.leaseResponseRTT,
+		clockResolution:   message.leaseClockResolution,
+		clockUnavailable:  message.leaseClockUnavailable,
+		deadlineUntrusted: deadline.IsZero(),
+	}, err
 }
 
-func (s *concurrentLeaseSource) renewLease(context.Context, *Message) (time.Time, error) {
+func (s *concurrentLeaseSource) renewLease(context.Context, *Message) (renewalLease, error) {
 	if atomic.AddInt32(&s.calls, 1) == 2 {
 		close(s.both)
 	}
 	<-s.release
-	return time.Now().Add(time.Second), nil
+	return renewalLease{deadline: time.Now().Add(time.Second)}, nil
 }
 
 func newBlockingRenewSettler() *blockingRenewSettler {
@@ -341,6 +352,66 @@ func TestReceiverRetryKeepsAttemptIDAcrossBackoff(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&observed); got != 1 {
 		t.Fatalf("error notifications = %d, want 1 after two consecutive receive failures", got)
+	}
+}
+
+func TestReceiverRetriesBrokerCanceledReceiveWithSameAttempt(t *testing.T) {
+	source := &fakeReceiveSource{}
+	source.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
+		switch call {
+		case 1:
+			return nil, &HTTPError{StatusCode: 499, cause: context.Canceled}
+		case 2:
+			return []*Message{source.message(1)}, nil
+		default:
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	receiver := newReceiver(source, "jobs", nil)
+	receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+	err := receiver.Run(ctx, func(context.Context, *Message) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled after test shutdown", err)
+	}
+	receives := source.receiveSnapshot()
+	if len(receives) != 2 {
+		t.Fatalf("receive calls = %+v, want shutdown response then successful replay", receives)
+	}
+	if receives[0].attemptID == "" || receives[0].attemptID != receives[1].attemptID {
+		t.Fatalf("attempt IDs = %q / %q, want one exact retry", receives[0].attemptID, receives[1].attemptID)
+	}
+	settles := source.settleSnapshot()
+	if len(settles) != 2 || settles[0].op != "renew" || settles[1].op != "complete" {
+		t.Fatalf("settlements = %+v, want replay fence then completion", settles)
+	}
+}
+
+func TestReceiverDoesNotRetryBrokerCanceledReceiveAfterCallerCancellation(t *testing.T) {
+	source := &fakeReceiveSource{}
+	ctx, cancel := context.WithCancel(context.Background())
+	source.receiveFn = func(context.Context, int, receiveRecord) ([]*Message, error) {
+		cancel()
+		return nil, &HTTPError{StatusCode: 499, cause: context.Canceled}
+	}
+	receiver := newReceiver(source, "jobs", nil)
+	var handlerCalls int32
+	err := receiver.Run(ctx, func(context.Context, *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want caller context cancellation", err)
+	}
+	if receives := source.receiveSnapshot(); len(receives) != 1 {
+		t.Fatalf("receive calls = %+v, want no retry after caller cancellation", receives)
+	}
+	if got := atomic.LoadInt32(&handlerCalls); got != 0 {
+		t.Fatalf("handler calls = %d, want none after caller cancellation", got)
 	}
 }
 
@@ -1119,7 +1190,7 @@ func TestReceiverGoexitJoinsAutoRenewBeforeReleasingPipelineSlots(t *testing.T) 
 		switch call {
 		case 1:
 			message := source.message(1)
-			message.LockedUntil = time.Now().Add(40 * time.Millisecond)
+			message.LockedUntil = time.Now().Add(120 * time.Millisecond)
 			return []*Message{message}, nil
 		case 2:
 			message := source.message(2)
@@ -1190,7 +1261,9 @@ func TestReceiverAutoRenewsAndAbandonsHandlerFailure(t *testing.T) {
 	source.receiveFn = func(ctx context.Context, call int, record receiveRecord) ([]*Message, error) {
 		if atomic.CompareAndSwapInt32(&returned, 0, 1) {
 			message := source.message(9)
-			message.LockedUntil = time.Now().Add(20 * time.Millisecond)
+			// Keep this lifecycle test above the pathological short-lease guard;
+			// dedicated coverage below verifies that sub-60ms exact leases fail closed.
+			message.LockedUntil = time.Now().Add(120 * time.Millisecond)
 			return []*Message{message}, nil
 		}
 		<-ctx.Done()
@@ -1526,13 +1599,13 @@ func TestReceiverAutoRenewUsesConfirmedLeaseWhenClientClockIsAhead(t *testing.T)
 			var renewCalls int32
 			renewedAfterDispatch := make(chan struct{})
 			source := &deadlineLeaseSource{fakeReceiveSource: base}
-			source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+			source.renewalLeaseFn = func(context.Context, *Message) (renewalLease, error) {
 				if atomic.AddInt32(&renewCalls, 1) == 2 {
 					close(renewedAfterDispatch)
 				}
 				// Renewal committed at the broker, but its absolute deadline
 				// remains in the past according to the client's fast clock.
-				return time.Now().Add(-time.Second), nil
+				return renewalLease{deadline: time.Now().Add(-time.Second), clockResolution: time.Second}, nil
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -1584,17 +1657,17 @@ func TestReceiverUntrustedLeaseAllowsNetworkRTTAboveCadence(t *testing.T) {
 	message.LockedUntil = time.Now().Add(-time.Second)
 	var renewCalls int32
 	source := &deadlineLeaseSource{fakeReceiveSource: base}
-	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+	source.renewalLeaseFn = func(ctx context.Context, _ *Message) (renewalLease, error) {
 		atomic.AddInt32(&renewCalls, 1)
 		timer := time.NewTimer(150 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
-			return time.Time{}, ctx.Err()
+			return renewalLease{}, ctx.Err()
 		case <-timer.C:
 			// The broker renews successfully, but its absolute deadline remains
 			// unusable according to the client's fast wall clock.
-			return time.Now().Add(-time.Second), nil
+			return renewalLease{deadline: time.Now().Add(-time.Second), clockResolution: time.Second}, nil
 		}
 	}
 	var observed int32
@@ -1640,9 +1713,9 @@ func TestReceiverUntrustedLeaseRenewalDoesNotSpin(t *testing.T) {
 	message.LockedUntil = time.Now().Add(-time.Second)
 	var renewCalls int32
 	source := &deadlineLeaseSource{fakeReceiveSource: base}
-	source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+	source.renewalLeaseFn = func(context.Context, *Message) (renewalLease, error) {
 		atomic.AddInt32(&renewCalls, 1)
-		return time.Now().Add(-time.Second), nil
+		return renewalLease{deadline: time.Now().Add(-time.Second), clockResolution: time.Second}, nil
 	}
 	receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew()})
 	receiver.process(context.Background(), message, func(context.Context, *Message) error {
@@ -1658,7 +1731,7 @@ func TestReceiverUntrustedLeaseRenewalDoesNotSpin(t *testing.T) {
 	}
 }
 
-func TestReceiverShortTrustedLeaseRenewsBeforeDeadline(t *testing.T) {
+func TestReceiverSubsecondTrustedLeaseRenewsBeforeDeadline(t *testing.T) {
 	var renewCalls int32
 	var receiveCalls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -1672,13 +1745,13 @@ func TestReceiverShortTrustedLeaseRenewsBeforeDeadline(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
 				SeqNumber: 55, LockToken: "lock-55",
-				LockedUntilMs: now.Add(40*time.Millisecond).UnixNano() / int64(time.Millisecond),
+				LockedUntilMs: now.Add(120*time.Millisecond).UnixNano() / int64(time.Millisecond),
 			}}})
 		case wire.PathRenewBatch:
 			atomic.AddInt32(&renewCalls, 1)
 			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
 				SeqNumber: 55, Ok: true,
-				LockedUntilMs: now.Add(40*time.Millisecond).UnixNano() / int64(time.Millisecond),
+				LockedUntilMs: now.Add(120*time.Millisecond).UnixNano() / int64(time.Millisecond),
 			}}})
 		case wire.PathComplete:
 			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
@@ -1804,6 +1877,190 @@ func TestReceiverCapsMappedInitialRenewalBudget(t *testing.T) {
 	}
 }
 
+func TestReceiverLongPollLowerBoundStillAllowsInitialRenewal(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(60)
+	message.localLeaseDeadline = time.Now().Add(-time.Millisecond)
+	// The complete long-poll RTT is charged against the lease. A message that
+	// arrived near the end of an 8s wait with a fresh 5s broker lock can therefore
+	// have an already-expired conservative lower bound on receipt.
+	message.LockedUntil = time.Now().Add(5 * time.Second)
+	message.leaseResponseRTT = 8 * time.Second
+	message.leaseClockResolution = time.Millisecond
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewalLeaseFn = func(ctx context.Context, _ *Message) (renewalLease, error) {
+		atomic.AddInt32(&renewCalls, 1)
+		if err := ctx.Err(); err != nil {
+			return renewalLease{}, fmt.Errorf("initial renewal was canceled before dispatch: %v", err)
+		}
+		return renewalLease{deadline: time.Now().Add(5 * time.Second), clockResolution: time.Millisecond}, nil
+	}
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { t.Errorf("initial renewal diagnostic = %v", err) }),
+	})
+	receiver.renewAttemptTimeout = 200 * time.Millisecond
+	var handlerCalls int32
+	receiver.process(context.Background(), message, func(context.Context, *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		return nil
+	}, func(error) { t.Error("bounded long-poll confirmation must remain message-scoped") })
+	if got := atomic.LoadInt32(&renewCalls); got != 1 {
+		t.Fatalf("renew calls = %d, want one bounded initial confirmation", got)
+	}
+	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+		t.Fatalf("handler calls = %d, want one after confirmed fresh broker lease", got)
+	}
+	settles := base.settleSnapshot()
+	if len(settles) != 1 || settles[0].op != "complete" {
+		t.Fatalf("settlements = %+v, want completion", settles)
+	}
+}
+
+func TestReceiverMappedHighRTTRenewalCannotOutliveLeaseHorizon(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(57)
+	message.localLeaseDeadline = time.Now().Add(250 * time.Millisecond)
+	message.LockedUntil = message.localLeaseDeadline
+	message.leaseResponseRTT = 200 * time.Millisecond
+	message.leaseClockResolution = time.Millisecond
+	renewCanceled := make(chan struct{})
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		<-ctx.Done()
+		close(renewCanceled)
+		return time.Time{}, ctx.Err()
+	}
+	observed := make(chan error, 1)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { observed <- err }),
+	})
+	started := time.Now()
+	var handlerCalls int32
+	receiver.process(context.Background(), message, func(context.Context, *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		return nil
+	}, func(error) { t.Error("lease loss must remain message-scoped") })
+	elapsed := time.Since(started)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("mapped renewal ran for %s, want the 250ms lease horizon rather than the 1s fallback", elapsed)
+	}
+	select {
+	case <-renewCanceled:
+	default:
+		t.Fatal("mapped renewal context was not canceled at the lease horizon")
+	}
+	if got := atomic.LoadInt32(&handlerCalls); got != 0 {
+		t.Fatalf("handler calls = %d, want none before initial confirmation", got)
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("diagnostic = %v, want ErrLockLost", err)
+		}
+	default:
+		t.Fatal("lease horizon exhaustion was not reported")
+	}
+}
+
+func TestReceiverConfirmsMeasuredHighRTTLeaseBeforeDispatch(t *testing.T) {
+	base := &fakeReceiveSource{}
+	message := base.message(59)
+	message.localLeaseDeadline = time.Now().Add(600 * time.Millisecond)
+	message.LockedUntil = message.localLeaseDeadline
+	message.leaseResponseRTT = 400 * time.Millisecond
+	message.leaseClockResolution = time.Millisecond
+	var renewCalls int32
+	source := &deadlineLeaseSource{fakeReceiveSource: base}
+	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+		call := atomic.AddInt32(&renewCalls, 1)
+		if call > 1 {
+			<-ctx.Done()
+			return time.Time{}, ctx.Err()
+		}
+		timer := time.NewTimer(400 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-timer.C:
+			return time.Now().Add(600 * time.Millisecond), nil
+		}
+	}
+	receiver := newReceiver(source, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { t.Errorf("high-RTT confirmation failed: %v", err) }),
+	})
+	var handlerCalls int32
+	receiver.process(context.Background(), message, func(context.Context, *Message) error {
+		atomic.AddInt32(&handlerCalls, 1)
+		return nil
+	}, func(error) { t.Error("high-RTT confirmation must remain message-scoped") })
+	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
+		t.Fatalf("handler calls = %d, want one after early confirmation", got)
+	}
+	if got := atomic.LoadInt32(&renewCalls); got < 1 || got > 2 {
+		t.Fatalf("renew calls = %d, want initial confirmation and at most one canceled background attempt", got)
+	}
+	settles := base.settleSnapshot()
+	if len(settles) != 1 || settles[0].op != "complete" {
+		t.Fatalf("settlements = %+v, want completion", settles)
+	}
+}
+
+func TestReceiverFailsClosedInsteadOfHotLoopingOnPathologicalExactLease(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining time.Duration
+	}{
+		{name: "below minimum interval", remaining: 45 * time.Millisecond},
+		{name: "inside safety window", remaining: time.Millisecond},
+		{name: "already expired", remaining: -time.Millisecond},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			message := base.message(58)
+			message.localLeaseDeadline = time.Now().Add(200 * time.Millisecond)
+			message.LockedUntil = message.localLeaseDeadline
+			message.leaseResponseRTT = 100 * time.Millisecond
+			message.leaseClockResolution = time.Millisecond
+			var renewCalls int32
+			source := &deadlineLeaseSource{fakeReceiveSource: base}
+			source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+				atomic.AddInt32(&renewCalls, 1)
+				return time.Now().Add(test.remaining), nil
+			}
+			observed := make(chan error, 1)
+			receiver := newReceiver(source, "jobs", []ReceiverOption{
+				WithAutoRenew(),
+				WithErrorHandler(func(err error) { observed <- err }),
+			})
+			var handlerCalls int32
+			receiver.process(context.Background(), message, func(context.Context, *Message) error {
+				atomic.AddInt32(&handlerCalls, 1)
+				return nil
+			}, func(error) { t.Error("pathological lease must remain message-scoped") })
+			if got := atomic.LoadInt32(&renewCalls); got != 1 {
+				t.Fatalf("renew calls = %d, want one confirmation rather than a hot loop", got)
+			}
+			if got := atomic.LoadInt32(&handlerCalls); got != 0 {
+				t.Fatalf("handler calls = %d, want fail-closed before dispatch", got)
+			}
+			select {
+			case err := <-observed:
+				if !errors.Is(err, ErrLockLost) {
+					t.Fatalf("diagnostic = %v, want ErrLockLost", err)
+				}
+			default:
+				t.Fatal("pathological lease was not reported")
+			}
+		})
+	}
+}
+
 func TestReceiverUsesServerTimeForSkewedLeaseCadence(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1875,6 +2132,309 @@ func TestReceiverUsesServerTimeForSkewedLeaseCadence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReceiverDateFallbackSurvivesShortLeaseAndMeasuredRTT(t *testing.T) {
+	const responseDelay = 150 * time.Millisecond
+	var sequence int64
+	var renewCalls int32
+	var completeCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case wire.PathReceive:
+			time.Sleep(responseDelay)
+			serverNow := time.Now().Add(-2 * time.Second)
+			w.Header().Set("Date", serverNow.UTC().Format(http.TimeFormat))
+			seq := atomic.AddInt64(&sequence, 1)
+			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+				SeqNumber: seq, LockToken: fmt.Sprintf("lock-%d", seq),
+				LockedUntilMs: serverNow.Add(time.Second).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathRenewBatch:
+			var request wire.RenewBatchRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil || len(request.Messages) != 1 {
+				t.Errorf("RenewBatch request = %+v, err %v", request, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			time.Sleep(responseDelay)
+			serverNow := time.Now().Add(-2 * time.Second)
+			w.Header().Set("Date", serverNow.UTC().Format(http.TimeFormat))
+			atomic.AddInt32(&renewCalls, 1)
+			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+				SeqNumber: request.Messages[0].SeqNumber, Ok: true,
+				LockedUntilMs: serverNow.Add(time.Second).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathComplete:
+			atomic.AddInt32(&completeCalls, 1)
+			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	receiver := newReceiver(client, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { t.Errorf("receiver diagnostic = %v", err) }),
+	})
+	for i := 0; i < 5; i++ {
+		messages, err := client.Receive(context.Background(), "jobs")
+		if err != nil {
+			t.Fatalf("Receive run %d: %v", i, err)
+		}
+		if len(messages) != 1 || messages[0].leaseClockResolution != time.Second {
+			t.Fatalf("Receive run %d messages = %+v, want one Date-mapped lease", i, messages)
+		}
+		receiver.process(context.Background(), messages[0], func(context.Context, *Message) error {
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		}, func(err error) { t.Errorf("fatal receiver error on run %d: %v", i, err) })
+	}
+	if got := atomic.LoadInt32(&completeCalls); got != 5 {
+		t.Fatalf("Complete calls = %d, want 5", got)
+	}
+	if got := atomic.LoadInt32(&renewCalls); got < 5 {
+		t.Fatalf("RenewBatch calls = %d, want at least one confirmation per run", got)
+	}
+}
+
+func TestReceiverMissingTimeHeadersUseUntrustedCadenceAcrossFastBrokerClock(t *testing.T) {
+	const responseDelay = 20 * time.Millisecond
+	var renewCalls int32
+	var completeCalls int32
+	secondRenew := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// A present nil Date entry suppresses net/http's automatic Date header.
+		// Simulate a proxy that strips both the broker time header and HTTP Date.
+		w.Header()["Date"] = nil
+		serverNow := time.Now().Add(100 * time.Second)
+		switch req.URL.Path {
+		case wire.PathReceive:
+			time.Sleep(responseDelay)
+			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+				SeqNumber: 71, LockToken: "lock-71",
+				LockedUntilMs: serverNow.Add(30*time.Second).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathRenewBatch:
+			var request wire.RenewBatchRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil || len(request.Messages) != 1 {
+				t.Errorf("RenewBatch request = %+v, err %v", request, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			time.Sleep(responseDelay)
+			call := atomic.AddInt32(&renewCalls, 1)
+			if call == 2 {
+				close(secondRenew)
+			}
+			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+				SeqNumber: request.Messages[0].SeqNumber, Ok: true,
+				LockedUntilMs: serverNow.Add(30*time.Second).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathComplete:
+			atomic.AddInt32(&completeCalls, 1)
+			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	messages, err := client.Receive(context.Background(), "jobs")
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("Receive messages = %d, err %v", len(messages), err)
+	}
+	message := messages[0]
+	if !message.leaseClockUnavailable || !message.localLeaseDeadline.IsZero() {
+		t.Fatalf("missing-header lease state = unavailable %v, local deadline %v", message.leaseClockUnavailable, message.localLeaseDeadline)
+	}
+	if message.leaseResponseRTT < responseDelay {
+		t.Fatalf("missing-header response RTT = %s, want at least %s", message.leaseResponseRTT, responseDelay)
+	}
+
+	var warnings int32
+	receiver := newReceiver(client, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) {
+			if err.Error() != "mqlite: broker time headers unavailable; lease scheduling is using degraded clock mode" {
+				t.Errorf("receiver diagnostic = %v", err)
+				return
+			}
+			atomic.AddInt32(&warnings, 1)
+		}),
+	})
+	receiver.process(context.Background(), message, func(context.Context, *Message) error {
+		if got := atomic.LoadInt32(&renewCalls); got != 1 {
+			t.Fatalf("renew calls before handler = %d, want one synchronous confirmation", got)
+		}
+		select {
+		case <-secondRenew:
+			return nil
+		case <-time.After(2 * time.Second):
+			t.Error("untrusted renewal cadence did not run")
+			return nil
+		}
+	}, func(err error) { t.Errorf("fatal receiver error = %v", err) })
+	if got := atomic.LoadInt32(&renewCalls); got < 2 {
+		t.Fatalf("RenewBatch calls = %d, want synchronous confirmation plus bounded background renewal", got)
+	}
+	if got := atomic.LoadInt32(&completeCalls); got != 1 {
+		t.Fatalf("Complete calls = %d, want one", got)
+	}
+	if got := atomic.LoadInt32(&warnings); got != 1 {
+		t.Fatalf("degraded-clock diagnostics = %d, want one", got)
+	}
+}
+
+func TestReceiverDoesNotMutateMessageDuringBackgroundRenewal(t *testing.T) {
+	var renewCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		serverNow := time.Now()
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(serverNow.UnixNano()/int64(time.Millisecond), 10))
+		switch req.URL.Path {
+		case wire.PathReceive:
+			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
+				SeqNumber: 61, LockToken: "lock-61",
+				LockedUntilMs: serverNow.Add(300*time.Millisecond).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathRenewBatch:
+			var request wire.RenewBatchRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil || len(request.Messages) != 1 {
+				t.Errorf("RenewBatch request = %+v, err %v", request, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			atomic.AddInt32(&renewCalls, 1)
+			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
+				SeqNumber: request.Messages[0].SeqNumber, Ok: true,
+				LockedUntilMs: serverNow.Add(300*time.Millisecond).UnixNano() / int64(time.Millisecond),
+			}}})
+		case wire.PathComplete:
+			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	messages, err := client.Receive(context.Background(), "jobs")
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("Receive messages = %d, err %v", len(messages), err)
+	}
+	receiver := newReceiver(client, "jobs", []ReceiverOption{
+		WithAutoRenew(),
+		WithErrorHandler(func(err error) { t.Errorf("renewal diagnostic = %v", err) }),
+	})
+	receiver.process(context.Background(), messages[0], func(context.Context, *Message) error {
+		until := time.Now().Add(350 * time.Millisecond)
+		for time.Now().Before(until) {
+			// Copying and formatting the public value is legal application code. All
+			// renewal metadata must therefore remain goroutine-local after dispatch.
+			_ = fmt.Sprintf("%v", *messages[0])
+			runtime.Gosched()
+		}
+		return nil
+	}, func(error) { t.Error("renewal failure must remain message-scoped") })
+	if got := atomic.LoadInt32(&renewCalls); got < 2 {
+		t.Fatalf("RenewBatch calls = %d, want concurrent background renewals", got)
+	}
+}
+
+func TestReceiverReportsMissingBrokerTimeHeadersOnce(t *testing.T) {
+	t.Run("one diagnostic for receiver lifetime", func(t *testing.T) {
+		source := &fakeReceiveSource{}
+		var warnings int32
+		var handlers int32
+		receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(err error) {
+			if err.Error() != "mqlite: broker time headers unavailable; lease scheduling is using degraded clock mode" {
+				t.Errorf("diagnostic = %v", err)
+			}
+			atomic.AddInt32(&warnings, 1)
+		})})
+		for seq := int64(1); seq <= 2; seq++ {
+			message := source.message(seq)
+			message.leaseClockUnavailable = true
+			receiver.process(context.Background(), message, func(context.Context, *Message) error {
+				atomic.AddInt32(&handlers, 1)
+				return nil
+			}, func(error) { t.Error("diagnostic must not stop the receiver") })
+		}
+		if got := atomic.LoadInt32(&warnings); got != 1 {
+			t.Fatalf("diagnostics = %d, want one", got)
+		}
+		if got := atomic.LoadInt32(&handlers); got != 2 {
+			t.Fatalf("handler calls = %d, want two", got)
+		}
+	})
+
+	t.Run("callback cancellation prevents dispatch", func(t *testing.T) {
+		source := &fakeReceiveSource{}
+		ctx, cancel := context.WithCancel(context.Background())
+		var handlers int32
+		receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) { cancel() })})
+		message := source.message(3)
+		message.leaseClockUnavailable = true
+		receiver.process(ctx, message, func(context.Context, *Message) error {
+			atomic.AddInt32(&handlers, 1)
+			return nil
+		}, func(error) { t.Error("diagnostic must not stop the receiver") })
+		if got := atomic.LoadInt32(&handlers); got != 0 {
+			t.Fatalf("handler calls = %d, want none after callback cancellation", got)
+		}
+		if settles := source.settleSnapshot(); len(settles) != 0 {
+			t.Fatalf("settlements = %+v, want none after callback cancellation", settles)
+		}
+	})
+
+	t.Run("first missing renewal header is reported", func(t *testing.T) {
+		base := &fakeReceiveSource{}
+		message := base.message(4)
+		message.localLeaseDeadline = time.Now().Add(120 * time.Millisecond)
+		message.leaseClockResolution = time.Millisecond
+		warning := make(chan struct{})
+		var warningOnce sync.Once
+		source := &deadlineLeaseSource{fakeReceiveSource: base}
+		source.renewalLeaseFn = func(context.Context, *Message) (renewalLease, error) {
+			return renewalLease{deadline: time.Now().Add(time.Second), clockUnavailable: true}, nil
+		}
+		receiver := newReceiver(source, "jobs", []ReceiverOption{
+			WithAutoRenew(),
+			WithErrorHandler(func(err error) {
+				if err.Error() != "mqlite: broker time headers unavailable; lease scheduling is using degraded clock mode" {
+					t.Errorf("diagnostic = %v", err)
+				}
+				warningOnce.Do(func() { close(warning) })
+			}),
+		})
+		receiver.process(context.Background(), message, func(context.Context, *Message) error {
+			select {
+			case <-warning:
+				return nil
+			case <-time.After(time.Second):
+				t.Error("missing renewal headers were not reported")
+				return nil
+			}
+		}, func(error) { t.Error("degraded clock diagnostic must not stop the receiver") })
+		if settles := base.settleSnapshot(); len(settles) != 1 || settles[0].op != "complete" {
+			t.Fatalf("settlements = %+v, want completion after diagnostic", settles)
+		}
+	})
 }
 
 func TestReceiverAutoRenewFencesEveryAttemptReplay(t *testing.T) {
@@ -2045,13 +2605,13 @@ func TestReceiverFailsClosedWhenSkewedLeaseRenewalFails(t *testing.T) {
 	message.LockedUntil = time.Now().Add(-time.Second)
 	var renewCalls int32
 	source := &deadlineLeaseSource{fakeReceiveSource: base}
-	source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+	source.renewalLeaseFn = func(context.Context, *Message) (renewalLease, error) {
 		if atomic.AddInt32(&renewCalls, 1) == 1 {
 			// Initial confirmation commits, but the fast client clock cannot use
 			// the broker's absolute deadline as local retry headroom.
-			return time.Now().Add(-time.Second), nil
+			return renewalLease{deadline: time.Now().Add(-time.Second), clockResolution: time.Second}, nil
 		}
-		return time.Time{}, errors.New("temporary renewal failure")
+		return renewalLease{}, errors.New("temporary renewal failure")
 	}
 	var handlerCalls int32
 	var observed []error
@@ -2160,16 +2720,16 @@ func TestReceiverCancelsHangingRenewAtUntrustedProbeTimeout(t *testing.T) {
 	renewCanceled := make(chan struct{})
 	var renewCalls int32
 	source := &deadlineLeaseSource{fakeReceiveSource: base}
-	source.renewLeaseFn = func(ctx context.Context, _ *Message) (time.Time, error) {
+	source.renewalLeaseFn = func(ctx context.Context, _ *Message) (renewalLease, error) {
 		if atomic.AddInt32(&renewCalls, 1) == 1 {
 			// The synchronous dispatch gate succeeds but cannot provide a locally
 			// trustworthy deadline under persistent clock skew.
-			return time.Now().Add(-time.Second), nil
+			return renewalLease{deadline: time.Now().Add(-time.Second), clockResolution: time.Second}, nil
 		}
 		close(renewStarted)
 		<-ctx.Done()
 		close(renewCanceled)
-		return time.Time{}, ctx.Err()
+		return renewalLease{}, ctx.Err()
 	}
 	observed := make(chan error, 1)
 	receiver := newReceiver(source, "jobs", []ReceiverOption{
@@ -2232,21 +2792,45 @@ func TestReceiverCancelsHangingRenewAtUntrustedProbeTimeout(t *testing.T) {
 
 func TestAutoRenewIntervalStaysInsideShortLease(t *testing.T) {
 	tests := []struct {
-		name      string
-		remaining time.Duration
-		want      time.Duration
+		name        string
+		remaining   time.Duration
+		responseRTT time.Duration
+		want        time.Duration
 	}{
-		{name: "one second", remaining: time.Second, want: time.Second / 3},
+		{name: "one second", remaining: time.Second, want: (time.Second - leaseDeadlineSafety) / 3},
 		{name: "spin guard", remaining: 120 * time.Millisecond, want: 50 * time.Millisecond},
-		{name: "twenty milliseconds", remaining: 20 * time.Millisecond, want: 10 * time.Millisecond},
-		{name: "long lease", remaining: time.Minute, want: 20 * time.Second},
-		{name: "smallest positive", remaining: time.Nanosecond, want: time.Nanosecond},
+		{name: "twenty milliseconds", remaining: 20 * time.Millisecond, want: 0},
+		{name: "measured RTT starts immediately", remaining: 600 * time.Millisecond, responseRTT: 400 * time.Millisecond, want: 0},
+		{name: "measured RTT caps ordinary cadence", remaining: time.Second, responseRTT: 400 * time.Millisecond, want: 180 * time.Millisecond},
+		{name: "long lease", remaining: time.Minute, want: (time.Minute - leaseDeadlineSafety) / 3},
+		{name: "smallest positive", remaining: time.Nanosecond, want: 0},
 		{name: "expired", remaining: 0, want: 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := autoRenewInterval(test.remaining); got != test.want {
-				t.Fatalf("autoRenewInterval(%s) = %s, want %s", test.remaining, got, test.want)
+			if got := autoRenewInterval(test.remaining, test.responseRTT); got != test.want {
+				t.Fatalf("autoRenewInterval(%s, %s) = %s, want %s", test.remaining, test.responseRTT, got, test.want)
+			}
+		})
+	}
+}
+
+func TestInitialLeaseConfirmationAccountsForClockPrecisionAndRTT(t *testing.T) {
+	tests := []struct {
+		name      string
+		lease     renewalLease
+		remaining time.Duration
+		want      bool
+	}{
+		{name: "ordinary exact lease", lease: renewalLease{clockResolution: time.Millisecond}, remaining: time.Second},
+		{name: "exact lease near measured RTT", lease: renewalLease{clockResolution: time.Millisecond, responseRTT: 400 * time.Millisecond}, remaining: 600 * time.Millisecond, want: true},
+		{name: "coarse Date lower bound", lease: renewalLease{clockResolution: time.Second}, remaining: 800 * time.Millisecond, want: true},
+		{name: "pathological exact lease", lease: renewalLease{clockResolution: time.Millisecond}, remaining: 45 * time.Millisecond, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := needsInitialLeaseConfirmation(test.lease, test.remaining); got != test.want {
+				t.Fatalf("needsInitialLeaseConfirmation = %v, want %v", got, test.want)
 			}
 		})
 	}
@@ -2271,7 +2855,9 @@ func TestRenewRetryClassification(t *testing.T) {
 		{name: "HTTP 503", err: &HTTPError{StatusCode: 503, cause: errors.New("unavailable")}, want: true},
 		{name: "HTTP 503 overrides permission code", err: &HTTPError{StatusCode: 503, cause: ErrPermissionDenied}, want: true},
 		{name: "HTTP 429", err: &HTTPError{StatusCode: 429, cause: errors.New("throttled")}, want: true},
+		{name: "broker HTTP 499 wraps cancellation", err: &HTTPError{StatusCode: 499, cause: context.Canceled}, want: true},
 		{name: "HTTP 400 overrides internal code", err: &HTTPError{StatusCode: 400, cause: errors.New("internal")}},
+		{name: "caller cancellation", err: context.Canceled},
 		{name: "lock lost", err: ErrLockLost},
 		{name: "invalid argument", err: ErrInvalidArgument},
 		{name: "permission denied", err: ErrPermissionDenied},
@@ -2543,11 +3129,11 @@ func TestReceiverRequiresContinuedConfirmationForUnusableRenewDeadline(t *testin
 			}
 			var renewCalls int32
 			source := &deadlineLeaseSource{fakeReceiveSource: base}
-			source.renewLeaseFn = func(context.Context, *Message) (time.Time, error) {
+			source.renewalLeaseFn = func(context.Context, *Message) (renewalLease, error) {
 				if atomic.AddInt32(&renewCalls, 1) == 1 {
-					return test.deadline(), nil
+					return renewalLease{deadline: test.deadline(), deadlineUntrusted: true}, nil
 				}
-				return time.Time{}, ErrLockLost
+				return renewalLease{}, ErrLockLost
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -2792,7 +3378,7 @@ func TestRenewCapabilityProbeDoesNotSerializeMessages(t *testing.T) {
 	for seq := int64(1); seq <= 2; seq++ {
 		message := base.message(seq)
 		go func(m *Message) {
-			_, err := receiver.renewMessage(context.Background(), m, time.Second)
+			_, err := receiver.renewMessage(context.Background(), m, time.Second, renewalLease{})
 			done <- err
 		}(message)
 	}
@@ -2871,7 +3457,7 @@ func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing
 	source.receiveFn = func(ctx context.Context, call int, record receiveRecord) ([]*Message, error) {
 		if atomic.CompareAndSwapInt32(&returned, 0, 1) {
 			message := source.message(11)
-			message.LockedUntil = time.Now().Add(20 * time.Millisecond)
+			message.LockedUntil = time.Now().Add(120 * time.Millisecond)
 			return []*Message{message}, nil
 		}
 		<-ctx.Done()
@@ -2922,7 +3508,7 @@ func TestReceiverJoinsInFlightRenewBeforeComplete(t *testing.T) {
 	settler := newBlockingRenewSettler()
 	message := &Message{
 		SequenceNumber: 12,
-		LockedUntil:    time.Now().Add(20 * time.Millisecond),
+		LockedUntil:    time.Now().Add(120 * time.Millisecond),
 		queue:          "jobs",
 		lockToken:      "token-12",
 		s:              settler,
