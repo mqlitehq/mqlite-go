@@ -399,6 +399,9 @@ func (c *Client) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]*P
 
 // CreateQueue creates or updates one queue.
 func (c *Client) CreateQueue(ctx context.Context, name string, config QueueConfig) error {
+	if err := config.validate(); err != nil {
+		return err
+	}
 	return c.post(ctx, wire.PathCreateQueue, wire.CreateQueueRequest{
 		Name: name,
 		Config: wire.QueueConfigJSON{

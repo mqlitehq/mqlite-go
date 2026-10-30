@@ -18,6 +18,85 @@ import (
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
 
+func TestCreateQueueRejectsUnsafeLockDurationWithoutRequest(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	for _, lockDuration := range []time.Duration{-time.Nanosecond, time.Nanosecond, time.Millisecond, time.Second - time.Nanosecond} {
+		err := client.CreateQueue(context.Background(), "jobs", QueueConfig{LockDuration: lockDuration})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("CreateQueue lock duration %s error = %v, want ErrInvalidArgument", lockDuration, err)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("invalid CreateQueue calls made %d HTTP requests, want none", got)
+	}
+}
+
+func TestCreateQueueLockDurationBoundary(t *testing.T) {
+	var requestsMu sync.Mutex
+	var requests []wire.CreateQueueRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wire.PathCreateQueue {
+			http.NotFound(w, r)
+			return
+		}
+		var request wire.CreateQueueRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		requestsMu.Lock()
+		requests = append(requests, request)
+		requestsMu.Unlock()
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	for _, test := range []struct {
+		name       string
+		duration   time.Duration
+		wantMillis int64
+	}{
+		{name: "broker default", duration: 0, wantMillis: 0},
+		{name: "minimum", duration: time.Second, wantMillis: 1000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := client.CreateQueue(context.Background(), "jobs", QueueConfig{LockDuration: test.duration}); err != nil {
+				t.Fatal(err)
+			}
+			requestsMu.Lock()
+			requestCount := len(requests)
+			if requestCount != 1 {
+				requestsMu.Unlock()
+				t.Fatalf("CreateQueue made %d requests, want one", requestCount)
+			}
+			request := requests[0]
+			requests = requests[:0]
+			requestsMu.Unlock()
+			if request.Name != "jobs" || request.Config.LockDurationMs != test.wantMillis {
+				t.Fatalf("CreateQueue request = %+v, want name jobs and lock_duration_ms %d", request, test.wantMillis)
+			}
+		})
+	}
+}
+
 func TestSendInvalidSuccessIsOutcomeUnknown(t *testing.T) {
 	const marker = "untrusted-ack-marker"
 	tests := []struct {

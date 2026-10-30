@@ -54,14 +54,18 @@ an intermediary strips both headers, the Receiver reports degraded clock mode
 once through its error handler, confirms ownership before dispatch, and keeps a
 bounded untrusted cadence rather than trusting the raw absolute deadline. Exact
 confirmed leases below the minimum renewal interval fail closed rather than
-producing a renewal hot loop. Without either time header there is no relative
-lease duration to prove, so preserve one header or keep the configured lock well
-above the 250ms degraded cadence plus network latency (1s or more is recommended).
+producing a renewal hot loop. For an existing queue created by an older client,
+without either time header there is no relative lease duration to prove, so
+preserve one header or keep the configured lock well above the 250ms degraded
+cadence plus network latency.
 Transient failures are retried only while the known lease is live. An untrusted
 confirmation has a separate one-second request watchdog and conservative
-cadence. Recovery is silent; confirmed loss cancels that message's handler
-context and reports one `ErrLockLost`. Handlers must stop promptly when their
-context is canceled.
+cadence. New queue configurations must use zero (the broker default) or a lock
+duration of at least 1s; `CreateQueue` rejects shorter values locally. Older
+queues with shorter locks can still exist, and their managed deliveries fail
+closed when the lease cannot be renewed safely. Recovery is silent; confirmed
+loss cancels that message's handler context and reports one `ErrLockLost`.
+Handlers must stop promptly when their context is canceled.
 
 Managed Receive keeps one `receive_attempt_id` across transport backoff. This
 replays a batch already claimed by the broker instead of claiming another one.
