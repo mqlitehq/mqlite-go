@@ -490,8 +490,7 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		if err != nil {
 			if !retryableRenewError(err) {
 				if permanentReceiverError(err) {
-					cancelHandler()
-					r.settleError(err, fail)
+					r.stopPermanentRenewal(cancelHandler, err, fail)
 					return
 				}
 				r.loseLease(cancelHandler, err)
@@ -610,6 +609,16 @@ func (r *Receiver) settleError(err error, fail func(error)) {
 	if permanentReceiverError(err) && !retryableOperationError(err) {
 		fail(err)
 	}
+}
+
+func (r *Receiver) stopPermanentRenewal(cancelHandler context.CancelFunc, err error, fail func(error)) {
+	// Stop the receive loop before releasing handler capacity. Otherwise the
+	// handler can observe cancellation and free its slot while a synchronous
+	// error callback is still running, allowing one more claim with credentials
+	// the broker has already rejected.
+	fail(err)
+	cancelHandler()
+	r.notify(err)
 }
 
 func renewalResponseHeadroom(responseRTT time.Duration) time.Duration {
@@ -858,8 +867,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 		}
 		if !retryableRenewError(err) {
 			if permanentReceiverError(err) {
-				cancelHandler()
-				r.settleError(err, fail)
+				r.stopPermanentRenewal(cancelHandler, err, fail)
 				return err
 			}
 			return r.loseLease(cancelHandler, err)

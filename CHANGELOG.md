@@ -20,6 +20,9 @@
   controlling context remains live. This prevents an older broker or
   intermediary cancellation response from stopping a Receiver without retrying
   caller cancellation, and Receive retains the same attempt ID.
+- Stop managed receiving before releasing handler capacity when renewal returns
+  a permanent authentication or permission error. A synchronous error callback
+  can no longer leave a window for one more claim with rejected credentials.
 - Fence a replayed receive with one broker renewal even when managed auto-renew
   is disabled. This avoids discarding a broker-valid lease solely because the
   client wall clock is ahead.

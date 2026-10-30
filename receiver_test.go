@@ -3616,12 +3616,14 @@ func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing
 	source := &fakeReceiveSource{}
 	source.renewFn = func(int) error { return ErrPermissionDenied }
 	var returned int32
+	secondReceive := make(chan struct{})
 	source.receiveFn = func(ctx context.Context, call int, record receiveRecord) ([]*Message, error) {
 		if atomic.CompareAndSwapInt32(&returned, 0, 1) {
 			message := source.message(11)
 			message.LockedUntil = time.Now().Add(120 * time.Millisecond)
 			return []*Message{message}, nil
 		}
+		close(secondReceive)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -3655,6 +3657,13 @@ func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing
 		close(releaseError)
 		t.Fatal("slow error handler delayed message handler cancellation")
 	}
+	select {
+	case <-secondReceive:
+		close(releaseError)
+		<-done
+		t.Fatal("receiver issued another claim while reporting permanent renewal failure")
+	case <-time.After(100 * time.Millisecond):
+	}
 	close(releaseError)
 	err := <-done
 	if !errors.Is(err, ErrPermissionDenied) {
@@ -3663,6 +3672,24 @@ func TestReceiverStopsRenewalBeforeSettlementAfterPermanentRenewError(t *testing
 	settles := source.settleSnapshot()
 	if len(settles) != 1 || settles[0].op != "renew" {
 		t.Fatalf("settlements = %+v", settles)
+	}
+	if receives := source.receiveSnapshot(); len(receives) != 1 {
+		t.Fatalf("receive calls = %d, want one", len(receives))
+	}
+}
+
+func TestPermanentRenewalStopsRunBeforeHandlerAndNotification(t *testing.T) {
+	events := make([]string, 0, 3)
+	receiver := newReceiver(nil, "jobs", []ReceiverOption{
+		WithErrorHandler(func(error) { events = append(events, "notify") }),
+	})
+	receiver.stopPermanentRenewal(
+		func() { events = append(events, "cancel-handler") },
+		ErrPermissionDenied,
+		func(error) { events = append(events, "fail-run") },
+	)
+	if got := fmt.Sprint(events); got != "[fail-run cancel-handler notify]" {
+		t.Fatalf("permanent renewal order = %s, want receiver stop before handler cancellation and notification", got)
 	}
 }
 
