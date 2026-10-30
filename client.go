@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
@@ -22,6 +24,26 @@ func (e *invalidSuccessResponseError) Error() string {
 }
 
 func (e *invalidSuccessResponseError) Unwrap() error { return e.cause }
+
+// HTTPError preserves the HTTP status returned by a broker or intermediary.
+// Use errors.As to inspect it while errors.Is continues to match any wrapped
+// MQLite sentinel.
+type HTTPError struct {
+	StatusCode int
+	cause      error
+}
+
+func (e *HTTPError) Error() string {
+	if e.cause == nil {
+		return fmt.Sprintf("mqlite: HTTP %d", e.StatusCode)
+	}
+	return e.cause.Error()
+}
+
+func (e *HTTPError) Unwrap() error { return e.cause }
+
+// HTTPStatus returns the response status code.
+func (e *HTTPError) HTTPStatus() int { return e.StatusCode }
 
 type ambiguousOutcomeError struct {
 	operation string
@@ -47,9 +69,17 @@ const (
 
 // Client is a remote MQLite JSON-over-HTTP client.
 type Client struct {
-	endpoint string
-	token    string
-	http     *http.Client
+	endpoint  string
+	token     string
+	http      *http.Client
+	ownedHTTP bool
+}
+
+type serverClockObservation struct {
+	localAt     time.Time
+	serverUpper time.Time
+	responseRTT time.Duration
+	resolution  time.Duration
 }
 
 type config struct {
@@ -66,14 +96,17 @@ func WithToken(token string) Option { return func(c *config) { c.token = token }
 // WithHTTPClient supplies a custom transport, proxy, or TLS configuration.
 // Do not set a global timeout shorter than the longest Receive wait.
 // The transport must honor request contexts and must not retry queue or
-// subscription deletion requests.
+// subscription deletion requests. Size MaxIdleConnsPerHost to at least Receiver
+// concurrency plus effective prefetch so overlapped settlement reuses connections.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *config) { c.httpClient = client }
 }
 
 // Open creates a remote client. Supported connection strings are http(s) URLs
 // and mqlite(s)://token@host[:port]. The context is retained for API parity with
-// the main MQLite SDK; individual calls use their own contexts.
+// the main MQLite SDK; individual calls use their own contexts. Open clones and
+// owns the standard *http.Transport. If http.DefaultTransport was replaced by a
+// wrapper, Open preserves that wrapper and leaves its pool lifecycle to its owner.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 	_ = ctx
 	endpoint, token, err := parseDSN(dsn)
@@ -90,16 +123,46 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 		token = cfg.token
 	}
 	httpClient := cfg.httpClient
+	ownedHTTP := false
 	if httpClient == nil {
 		// Receive is a long poll. The request context, not a global client timeout,
-		// owns its deadline.
-		httpClient = &http.Client{}
+		// owns its deadline. Clone the standard transport so managed receiver
+		// concurrency has a useful per-host idle pool and Client.Close can release
+		// only this client's connections.
+		if base, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport := base.Clone()
+			transport.MaxIdleConnsPerHost = 64
+			if transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
+				transport.MaxIdleConns = transport.MaxIdleConnsPerHost
+			}
+			httpClient = &http.Client{Transport: transport}
+			ownedHTTP = true
+		} else {
+			// Instrumentation and HTTP test packages commonly wrap the process-wide
+			// transport. Preserve that behavior instead of making an SDK upgrade a
+			// startup failure. The wrapper and its connection pool remain externally
+			// owned, exactly as they are for a caller-supplied HTTP client.
+			httpClient = &http.Client{Transport: http.DefaultTransport}
+		}
 	}
-	return &Client{endpoint: endpoint, token: token, http: httpClient}, nil
+	// RPC endpoints never redirect. A 307/308 would replay a POST body and can
+	// forward Authorization to another port on the same host. Clone the caller's
+	// client so enforcing this policy does not mutate shared configuration.
+	clientCopy := *httpClient
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Client{endpoint: endpoint, token: token, http: &clientCopy, ownedHTTP: ownedHTTP}, nil
 }
 
-// Close releases client resources. The standard HTTP client needs no close.
-func (c *Client) Close() error { return nil }
+// Close releases idle connections owned by this client. A caller-supplied HTTP
+// client and its transport remain under the caller's ownership.
+func (c *Client) Close() error {
+	if c.ownedHTTP {
+		c.http.CloseIdleConnections()
+	}
+	return nil
+}
 
 // Endpoint returns the credential-free base URL this client dials.
 func (c *Client) Endpoint() string { return c.endpoint }
@@ -200,7 +263,24 @@ func readBounded(reader io.Reader, limit int64) ([]byte, error) {
 	return data, nil
 }
 
+func readResponseBounded(reader io.Reader, contentLength, limit int64) ([]byte, error) {
+	if contentLength > limit {
+		return nil, fmt.Errorf("mqlite: response exceeds %d bytes", limit)
+	}
+	return readBounded(reader, limit)
+}
+
 func (c *Client) post(ctx context.Context, path string, body interface{}, out interface{}) error {
+	return c.postWithObservation(ctx, path, body, out, nil)
+}
+
+func (c *Client) postObserved(ctx context.Context, path string, body interface{}, out interface{}) (serverClockObservation, error) {
+	var observation serverClockObservation
+	err := c.postWithObservation(ctx, path, body, out, &observation)
+	return observation, err
+}
+
+func (c *Client) postWithObservation(ctx context.Context, path string, body interface{}, out interface{}, observation *serverClockObservation) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -215,20 +295,21 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	httpClient := c.http
-	if isLifecycleDelete(path) {
-		clone := *c.http
-		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-		httpClient = &clone
-	}
-	resp, err := httpClient.Do(req)
+	started := time.Now()
+	resp, err := c.http.Do(req)
 	if err != nil {
 		if isLifecycleDelete(path) {
 			return fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %v", ErrOutcomeUnknown, reconcileHint(path), err)
 		}
 		return err
+	}
+	if resp.StatusCode/100 == 2 && observation != nil {
+		observed, _ := observeServerTime(resp.Header, started, time.Now())
+		// Even when neither clock header survived an intermediary, retain the
+		// response timestamp and measured RTT. localLeaseDeadline still refuses to
+		// map without serverUpper, while the Receiver can diagnose and enter its
+		// bounded untrusted schedule.
+		*observation = observed
 	}
 	defer resp.Body.Close()
 
@@ -238,15 +319,21 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 	if isLifecycleDelete(path) && resp.StatusCode/100 == 5 {
 		return fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, reconcileHint(path))
 	}
+	if resp.StatusCode/100 == 3 {
+		// Redirect metadata and bodies come from an untrusted intermediary. RPCs
+		// never follow redirects, and ordinary calls expose only the status needed
+		// for stable classification rather than reflecting Location or body text.
+		return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("mqlite: unexpected HTTP redirect %d", resp.StatusCode)}
+	}
 	if resp.StatusCode/100 != 2 {
-		data, readErr := readBounded(resp.Body, maxErrorBytes)
+		data, readErr := readResponseBounded(resp.Body, resp.ContentLength, maxErrorBytes)
 		var errorBody wire.ErrorBody
 		if readErr == nil {
 			_ = json.Unmarshal(data, &errorBody)
 		}
 		if resp.StatusCode == http.StatusNotFound &&
 			(errorBody.Code == "" || strings.HasPrefix(errorBody.Message, "no such path")) {
-			return fmt.Errorf("%w: %s", ErrUnsupported, path)
+			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
 			errorBody.Code = "unauthenticated"
@@ -255,12 +342,12 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 			errorBody.Code = "permission_denied"
 		}
 		if path == wire.PathDeleteSubscription && errorBody.Code == "not_found" {
-			return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, errorBody.Message)
+			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, errorBody.Message)}
 		}
 		if path == wire.PathSubscribe && errorBody.Code == "resource_exhausted" {
-			return fmt.Errorf("%w: %s", ErrSubscriptionLimit, errorBody.Message)
+			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, errorBody.Message)}
 		}
-		return mapError(errorBody)
+		return &HTTPError{StatusCode: resp.StatusCode, cause: mapError(resp.StatusCode, errorBody)}
 	}
 
 	if out == nil {
@@ -273,7 +360,7 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 	case wire.PathListSubscriptionsPage:
 		data, err = wire.ReadListSubscriptionsPageResponse(resp.Body)
 	default:
-		data, err = readBounded(resp.Body, maxResponseBytes)
+		data, err = readResponseBounded(resp.Body, resp.ContentLength, maxResponseBytes)
 	}
 	if err != nil {
 		if isLifecycleDelete(path) {
@@ -291,11 +378,74 @@ func (c *Client) post(ctx context.Context, path string, body interface{}, out in
 	return nil
 }
 
-func mapError(body wire.ErrorBody) error {
+// observeServerTime converts broker response time into a conservative upper
+// bound for server time when the response reached us. New brokers expose epoch
+// milliseconds; older brokers fall back to HTTP's second-resolution Date. The
+// full round trip is charged as uncertainty, even though only the response leg
+// elapsed after the server generated the header.
+func observeServerTime(header http.Header, started, received time.Time) (serverClockObservation, bool) {
+	roundTrip := received.Sub(started)
+	if roundTrip < 0 {
+		roundTrip = 0
+	}
+	var serverTime time.Time
+	resolution := time.Millisecond
+	if value := header.Get(wire.ServerTimeHeader); value != "" {
+		millis, err := strconv.ParseInt(value, 10, 64)
+		if err == nil && millis > 0 {
+			serverTime = time.Unix(millis/1000, (millis%1000)*int64(time.Millisecond))
+		}
+	}
+	if serverTime.IsZero() {
+		serverDate, err := http.ParseTime(header.Get("Date"))
+		if err != nil {
+			// Preserve the measured RTT even when an intermediary stripped both
+			// clock headers. The managed Receiver cannot map the absolute lease in
+			// this mode, but it can still retain transport diagnostics and must not
+			// silently treat the raw broker timestamp as a local deadline.
+			return serverClockObservation{localAt: received, responseRTT: roundTrip}, false
+		}
+		serverTime = serverDate
+		resolution = time.Second
+	}
+	return serverClockObservation{
+		localAt:     received,
+		serverUpper: serverTime.Add(resolution).Add(roundTrip),
+		responseRTT: roundTrip,
+		resolution:  resolution,
+	}, true
+}
+
+// localLeaseDeadline translates a broker wall-clock deadline onto the local
+// monotonic clock. HTTP Date is available on old brokers, so this is a backward-
+// compatible clock-skew fallback while a millisecond protocol field is absent.
+func (observation serverClockObservation) localLeaseDeadline(remote time.Time) (time.Time, bool) {
+	if remote.IsZero() {
+		return time.Time{}, false
+	}
+	if observation.localAt.IsZero() || observation.serverUpper.IsZero() {
+		return time.Time{}, false
+	}
+	now := time.Now()
+	age := now.Sub(observation.localAt)
+	if age < 0 {
+		return time.Time{}, false
+	}
+	remaining := remote.Sub(observation.serverUpper.Add(age))
+	return now.Add(remaining), true
+}
+
+func mapError(statusCode int, body wire.ErrorBody) error {
 	var target error
 	switch body.Code {
 	case "not_found":
-		target = ErrNotFound
+		if body.Resource == "queue" {
+			target = ErrQueueNotFound
+		} else if body.Resource == "subscription" {
+			target = ErrSubscriptionNotFound
+		} else {
+			target = ErrNotFound
+		}
 	case "already_exists":
 		target = ErrDedupConflict
 	case "queue_not_empty":
@@ -322,7 +472,7 @@ func mapError(body wire.ErrorBody) error {
 		target = ErrOutcomeUnknown
 	default:
 		if body.Code == "" {
-			return fmt.Errorf("mqlite: request failed")
+			return fmt.Errorf("mqlite: request failed: HTTP %d", statusCode)
 		}
 		return fmt.Errorf("mqlite: %s: %s", body.Code, body.Message)
 	}

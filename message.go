@@ -26,6 +26,14 @@ type Message struct {
 	queue     string
 	lockToken string
 	s         settler
+
+	// localLeaseDeadline is derived from broker response time and uses Go's
+	// monotonic clock. It is intentionally private: LockedUntil preserves the exact
+	// wire value while the managed receiver gets a skew-resistant schedule.
+	localLeaseDeadline    time.Time
+	leaseResponseRTT      time.Duration
+	leaseClockResolution  time.Duration
+	leaseClockUnavailable bool
 }
 
 // AbandonOpts configures an Abandon operation.

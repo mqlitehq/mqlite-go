@@ -6,6 +6,15 @@ import (
 	"time"
 )
 
+// queueNotFoundError is the queue-specific form of ErrNotFound. Keeping the
+// hierarchy in the sentinel itself makes errors.Is portable between embedded
+// MQLite and this remote-only SDK.
+type queueNotFoundError struct{}
+
+func (queueNotFoundError) Error() string { return "mqlite: queue not found" }
+
+func (queueNotFoundError) Is(target error) bool { return target == ErrNotFound }
+
 // Sentinel errors are stable categories returned by the remote broker client.
 var (
 	ErrLockLost             = errors.New("mqlite: lock lost")
@@ -16,7 +25,7 @@ var (
 	ErrInvalidArgument      = errors.New("mqlite: invalid argument")
 	ErrNotFound             = errors.New("mqlite: not found")
 	ErrUnsupported          = errors.New("mqlite: operation unsupported by broker")
-	ErrQueueNotFound        = errors.New("mqlite: queue not found")
+	ErrQueueNotFound        = error(queueNotFoundError{})
 	ErrDedupConflict        = errors.New("mqlite: message ID conflicts with existing body")
 	ErrMessageTooLarge      = errors.New("mqlite: message too large")
 	ErrNameConflict         = errors.New("mqlite: resource name conflict")

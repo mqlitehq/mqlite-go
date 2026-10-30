@@ -79,13 +79,51 @@ func process(body []byte) error { return nil }
 
 `Client.Receiver` provides a managed consume loop with bounded concurrency,
 idempotent receive retries, optional lock renewal, and automatic Complete or
-Abandon based on the handler result. Auto-renew schedules from the delivery's
-remaining lease and safely retries one transient renewal; the configured lock
-duration must still leave enough time for the network round trip, and the
-application and broker clocks should be synchronized. Shutdown is cooperative:
-handlers and custom HTTP transports must honor request contexts, and an error
-handler must return promptly. The receiver waits for an in-flight renewal to
-exit before it completes or abandons the same lock token.
+Abandon based on the handler result. `WithConcurrency(C)` limits simultaneous
+handler calls. After a handler returns, its terminal settlement may overlap the
+next claim wave; total handler-plus-settlement work is bounded at
+`C + effective prefetch` (at most `2C`, and `2C` by default), while each Receive
+still claims no more messages than reserved handler slots. Auto-renew schedules
+from the delivery's remaining lease. It uses the deadline-bearing batch renewal
+route when the broker supports it and permanently falls back to legacy
+single-message renewal otherwise. Transient renewal failures are retried with
+backoff while the known lease is live; a recovered retry is not reported. If a
+transient failure exhausts the known lease, or the broker reports that the lock
+was lost, the message-specific handler context is canceled and the error handler
+receives one `ErrLockLost`. Permanent authorization or resource errors retain
+their specific sentinel and stop `Run`. The configured lock duration must still
+leave enough time for the network round trip. The receiver translates the
+broker's millisecond server-time header onto the local monotonic clock and uses
+measured response RTT to start renewal early; an exact mapped lease horizon
+that is still outside the safety window remains the hard request watchdog. A
+conservative lower bound already consumed by a long poll gets one bounded
+confirmation before dispatch. Older brokers use the standard HTTP `Date` header.
+Its one-second precision is charged against the lease, and a coarse
+horizon that cannot safely fit that precision plus measured RTT uses bounded
+untrusted confirmation. If an intermediary strips both headers, the SDK reports
+degraded clock mode once through `WithErrorHandler`, confirms the lease before
+dispatch, and keeps using bounded untrusted confirmation instead of scheduling
+from the raw absolute `LockedUntil`. Exact leases too short to support the 50ms
+minimum renewal interval fail closed rather than hot-looping.
+The no-header fallback has no relative lease duration to prove: preserve either
+time header, or configure the lock well above its 250ms cadence plus network
+latency (1s or more is recommended).
+If no response-time sample yields a usable deadline, a successful renewal still
+releases the handler and the receiver uses a conservative confirmation cadence.
+The first later renewal failure cancels the handler because no safe retry window
+is known.
+Shutdown is cooperative. Trusted renewal requests are bounded by the known lease
+window and untrusted confirmations use a one-second watchdog. Handlers and custom
+HTTP transports must honor request contexts, and an error handler must return
+promptly. The receiver waits for an in-flight renewal to exit before it settles
+the same lock token.
+Complete and Abandon use bounded exact-request retries so a lost broker response
+can be reconciled through the broker's settlement receipt without running the
+handler again.
+When a broker or intermediary returns HTTP 499 for a managed request, the
+Receiver treats that response as transient only while its own controlling
+context remains live. Receive reuses the same attempt ID; canceling the caller
+context never triggers another request.
 
 ## Topics and subscriptions
 
@@ -161,7 +199,13 @@ server permissions.
 - Managed `Receiver.Run` with concurrency, prefetch, and auto-renew.
 - Queue create/list/delete, DLQ redrive/purge, and broker status.
 - Subscription create/filter/TTL, bounded inventory, filter test, and deletion.
-- Strict error mapping with `errors.Is` sentinels.
+- Strict error mapping with `errors.Is` sentinels and `errors.As` to
+  `*mqlite.HTTPError` for ordinary non-deletion HTTP error responses.
+
+Against a resource-aware broker, a missing queue matches both
+`mqlite.ErrQueueNotFound` and the broader `mqlite.ErrNotFound`. Older brokers do
+not send the additive `resource` discriminator, so their legacy response can only
+match `ErrNotFound`.
 
 The initial release intentionally omits embedded mode, transactional outbox,
 canonical observability decoding, and managed access-key issuance. Those remain
@@ -187,16 +231,30 @@ history.
 ## Reliability boundary
 
 MQLite delivery is at-least-once. Handlers must be idempotent. Lock tokens fence
-settlement, and a receive retry reuses the same attempt ID so a lost response
-does not claim another batch. Destructive queue/subscription deletion is sent at
-most once: redirects, transport failures, and gateway 5xx responses return
+settlement, and managed receive retries retain the same attempt ID across
+backoff so a lost response does not claim another batch. A replay whose lease is
+already expired on the local clock is fenced by one broker renewal before
+dispatch, even when managed auto-renew is disabled. The SDK does not follow HTTP
+redirects for any RPC. Destructive queue/subscription deletion is sent at most
+once: redirects, transport failures, and gateway 5xx responses return
 `ErrOutcomeUnknown` for read-only reconciliation rather than automatic replay.
-`CompleteBatch` also reports `ErrOutcomeUnknown` when a successful HTTP response
-does not acknowledge the requested messages coherently; some completions may
-already have committed.
+Other redirected RPCs fail at the configured endpoint without sending the token
+or body to the redirect destination.
+Commit-capable sends, scheduling cancellation, Complete, Abandon, Reject,
+Defer, Renew, `CompleteBatch`, and `RenewBatch` report `ErrOutcomeUnknown` when
+a successful HTTP response does not acknowledge the requested operation
+coherently; the write may already have committed. An invalid success
+acknowledgement for AtMostOnce Receive is also outcome-unknown because
+receive-and-delete may have removed messages. Peek-Lock Receive remains
+replayable with the same attempt ID. The managed receiver replays only exact
+fenced renewal, Complete, or Abandon requests within its retry budget.
+HTTP 499 from a broker or intermediary is retryable in these managed loops only
+while their controlling context remains live; caller cancellation is not replayed.
 
-`Receiver.Run` always uses Peek-Lock; a process crash or lost Complete response
-can cause redelivery rather than silent removal. Explicit
+`Receiver.Run` always uses Peek-Lock and replays an identical Complete or
+Abandon request for up to five seconds after a retryable failure. A process
+crash, an expired lock, or a settlement outage beyond that bound can still cause
+redelivery rather than silent removal. Explicit
 `Receive(..., RecvOpts{AtMostOnce: true})`, subscription TTL expiry, force
 deletion, purge, cancel, and configured DLQ retention are deliberate data
 removal boundaries. Message TTL expiry enters the DLQ by default and discards
