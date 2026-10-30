@@ -61,10 +61,12 @@ cadence plus network latency.
 Transient failures are retried only while the known lease is live. An untrusted
 confirmation has a separate one-second request watchdog and conservative
 cadence. New queue configurations must use zero (the broker default) or a lock
-duration of at least 1s; `CreateQueue` rejects shorter values locally. Older
-queues with shorter locks can still exist, and their managed deliveries fail
-closed when the lease cannot be renewed safely. Recovery is silent; confirmed
-loss cancels that message's handler context and reports one `ErrLockLost`.
+duration from 1s through 1h; `CreateQueue` rejects values outside that range
+locally. Older queues outside the range can still exist, and a managed delivery
+on a very short legacy lease fails closed when it cannot be renewed safely.
+Queue updates affect future lease extensions and never shorten a deadline already
+issued to a consumer. Recovery is silent; confirmed loss cancels that message's
+handler context and reports one `ErrLockLost`.
 Handlers must stop promptly when their context is canceled.
 
 Managed Receive keeps one `receive_attempt_id` across transport backoff. This

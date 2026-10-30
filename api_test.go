@@ -32,7 +32,14 @@ func TestCreateQueueRejectsUnsafeLockDurationWithoutRequest(t *testing.T) {
 	}
 	defer client.Close()
 
-	for _, lockDuration := range []time.Duration{-time.Nanosecond, time.Nanosecond, time.Millisecond, time.Second - time.Nanosecond} {
+	for _, lockDuration := range []time.Duration{
+		-time.Nanosecond,
+		time.Nanosecond,
+		time.Millisecond,
+		time.Second - time.Nanosecond,
+		time.Hour + time.Nanosecond,
+		time.Duration(1<<63 - 1),
+	} {
 		err := client.CreateQueue(context.Background(), "jobs", QueueConfig{LockDuration: lockDuration})
 		if !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("CreateQueue lock duration %s error = %v, want ErrInvalidArgument", lockDuration, err)
@@ -76,6 +83,7 @@ func TestCreateQueueLockDurationBoundary(t *testing.T) {
 	}{
 		{name: "broker default", duration: 0, wantMillis: 0},
 		{name: "minimum", duration: time.Second, wantMillis: 1000},
+		{name: "maximum", duration: time.Hour, wantMillis: 3_600_000},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := client.CreateQueue(context.Background(), "jobs", QueueConfig{LockDuration: test.duration}); err != nil {
