@@ -26,6 +26,9 @@ const (
 	maxInitialRenewAttemptTimeout = 5 * time.Second
 	receiveBackoffBase            = 500 * time.Millisecond
 	receiveBackoffMax             = 3 * time.Second
+	// Bound one server-paced Receive wait so stale intermediary metadata cannot
+	// silently park a long-lived consumer.
+	receiveRetryAfterMax = 60 * time.Second
 )
 
 type receiveSource interface {
@@ -212,11 +215,13 @@ func waitContext(ctx context.Context, delay time.Duration) bool {
 }
 
 // receiveRetryDelay returns the wait before replaying the current Receive
-// attempt. The first transient failure is replayed immediately to recover a
-// response that may have been lost after the broker committed the claim. Later
-// generated delays use equal-jitter exponential backoff capped at three seconds.
-// A valid Retry-After from HTTP 429/503 is a lower bound, not part of that cap.
-func (r *Receiver) receiveRetryDelay(failures int, err error) time.Duration {
+// attempt. The first transient failure adds no client-generated delay so a
+// response lost after a committed claim is replayed promptly. Later generated
+// delays use equal-jitter exponential backoff capped at three seconds.
+// A valid Retry-After from HTTP 429/503 can raise that generated delay, up to
+// receiveRetryAfterMax. The boolean reports whether the server hint raised the
+// delay, so even a first failure is observable before the Receiver waits.
+func (r *Receiver) receiveRetryDelay(failures int, err error) (time.Duration, bool) {
 	delay := time.Duration(0)
 	if failures > 1 {
 		nominal := exponentialBackoff(receiveBackoffBase, receiveBackoffMax, failures-2)
@@ -228,10 +233,15 @@ func (r *Receiver) receiveRetryDelay(failures int, err error) time.Duration {
 			delay = receiveBackoffMax
 		}
 	}
-	if hint, ok := managedReceiveRetryAfter(err); ok && hint > delay {
-		return hint
+	if hint, ok := managedReceiveRetryAfter(err); ok {
+		if hint > receiveRetryAfterMax {
+			hint = receiveRetryAfterMax
+		}
+		if hint > delay {
+			return hint, true
+		}
 	}
-	return delay
+	return delay, false
 }
 
 // managedReceiveRetryAfter returns a private server pacing hint only for the
@@ -381,10 +391,10 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			}
 			hadTransientFailure = true
 			failures++
-			if failures > 1 {
+			delay, serverPaced := r.receiveRetryDelay(failures, err)
+			if failures > 1 || serverPaced {
 				r.notify(err)
 			}
-			delay := r.receiveRetryDelay(failures, err)
 			if !r.receiveWait(runCtx, delay) {
 				break
 			}

@@ -5,8 +5,9 @@
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
-  hints on HTTP 429 and 503 are delay lower bounds and may exceed that cap;
-  cancellation remains immediately interruptible.
+  hints on HTTP 429 and 503 may raise one delay up to a separate 60s cap. A hint
+  that raises the generated delay is reported before waiting, including on the
+  first failure; cancellation remains immediately interruptible.
 - Reject queue lock durations outside the broker's supported 1-second through
   1-hour range before sending a CreateQueue request. Zero still selects the
   broker's documented default, and both range endpoints are valid. This

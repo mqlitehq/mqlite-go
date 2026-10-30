@@ -75,16 +75,19 @@ An HTTP 499 response produced by a broker or intermediary is retryable in this
 managed loop only while the Receiver's controlling context remains live; caller
 cancellation is never replayed.
 
-The first failure gets one silent replay with no client-generated delay; a
-second consecutive failure is reported and starts equal-jitter exponential
-backoff with a 500ms base and a three-second generated cap. A valid
-delta-seconds or HTTP-date `Retry-After` on HTTP 429 or 503 is a lower bound for
-any retry and may exceed the generated cap. An HTTP-date value uses the `Date`
-header from that same response as its clock reference, falling back to local
-response receipt time when `Date` is absent or malformed. Zero does not suppress
-normal later backoff, malformed or negative values are ignored, and caller
-cancellation interrupts the wait. A successful Receive, including an empty
-result, ends that retry round and the next Receive uses a fresh attempt ID.
+The first failure gets one replay with no client-generated delay; it stays
+silent unless server pacing raises that delay. A second consecutive failure is
+reported and starts equal-jitter exponential backoff with a 500ms base and a
+three-second generated cap. A valid
+delta-seconds or HTTP-date `Retry-After` on HTTP 429 or 503 may raise one retry
+delay up to a separate 60-second cap. When it raises the generated delay, the
+error handler is called before waiting, including on the first failure. An
+HTTP-date value uses the `Date` header from that same response as its clock
+reference, falling back to local response receipt time when `Date` is absent or
+malformed. Zero does not suppress normal later backoff, malformed or negative
+values are ignored, and caller cancellation interrupts the wait. A successful
+Receive, including an empty result, ends that retry round and the next Receive
+uses a fresh attempt ID.
 Every replayed Peek-Lock batch is fenced by one broker renewal before handler
 dispatch, even when continuing auto-renew is disabled. Complete and Abandon then
 replay the exact same fenced request within a five-second bound; matching broker
