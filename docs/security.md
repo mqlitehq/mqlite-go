@@ -72,16 +72,26 @@ replays a batch already claimed by the broker instead of claiming another one.
 An HTTP 499 response produced by a broker or intermediary is retryable in this
 managed loop only while the Receiver's controlling context remains live; caller
 cancellation is never replayed.
-The first failure gets one immediate, silent replay; a second consecutive
-failure is reported and starts exponential jittered backoff. Every replayed
-Peek-Lock batch is fenced by one broker renewal before handler dispatch, even
-when continuing auto-renew is disabled. Complete and Abandon then replay the exact
-same fenced request within a five-second bound; matching broker settlement
-receipts make a lost-response replay idempotent. A handler slot is released when
-the handler returns, while a separate total-in-flight slot remains held through
-renewal shutdown and terminal settlement. The latter is capped at concurrency
-plus effective prefetch (at most twice concurrency), so settlement latency can
-overlap one claim wave without building an unbounded local lock queue.
+
+The first failure gets one silent replay with no client-generated delay; a
+second consecutive failure is reported and starts equal-jitter exponential
+backoff with a 500ms base and a three-second generated cap. A valid
+delta-seconds or HTTP-date `Retry-After` on HTTP 429 or 503 is a lower bound for
+any retry and may exceed the generated cap. An HTTP-date value uses the `Date`
+header from that same response as its clock reference, falling back to local
+response receipt time when `Date` is absent or malformed. Zero does not suppress
+normal later backoff, malformed or negative values are ignored, and caller
+cancellation interrupts the wait. A successful Receive, including an empty
+result, ends that retry round and the next Receive uses a fresh attempt ID.
+Every replayed Peek-Lock batch is fenced by one broker renewal before handler
+dispatch, even when continuing auto-renew is disabled. Complete and Abandon then
+replay the exact same fenced request within a five-second bound; matching broker
+settlement receipts make a lost-response replay idempotent. A handler slot is
+released when the handler returns, while a separate total-in-flight slot remains
+held through renewal shutdown and terminal settlement. The latter is capped at
+concurrency plus effective prefetch (at most twice concurrency), so settlement
+latency can overlap one claim wave without building an unbounded local lock
+queue.
 
 Queue and subscription deletion are name-addressed destructive operations. The
 SDK disables redirect following for every RPC and never transparently retries

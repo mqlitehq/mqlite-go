@@ -24,6 +24,8 @@ const (
 	uncertainLeaseRenewPeriod     = 250 * time.Millisecond
 	defaultRenewAttemptTimeout    = time.Second
 	maxInitialRenewAttemptTimeout = 5 * time.Second
+	receiveBackoffBase            = 500 * time.Millisecond
+	receiveBackoffMax             = 3 * time.Second
 )
 
 type receiveSource interface {
@@ -86,16 +88,18 @@ type Receiver struct {
 	queue string
 	cfg   receiverConfig
 
-	errMu                 sync.Mutex
-	transientBackoff      time.Duration
-	maxReceiveBackoff     time.Duration
-	renewRetryBackoff     time.Duration
-	maxRenewBackoff       time.Duration
-	settleBackoff         time.Duration
-	maxSettleBackoff      time.Duration
-	settleTimeout         time.Duration
-	renewAttemptTimeout   time.Duration
-	jitter                func(time.Duration) time.Duration
+	errMu               sync.Mutex
+	renewRetryBackoff   time.Duration
+	maxRenewBackoff     time.Duration
+	settleBackoff       time.Duration
+	maxSettleBackoff    time.Duration
+	settleTimeout       time.Duration
+	renewAttemptTimeout time.Duration
+	jitter              func(time.Duration) time.Duration
+	// Receive has separate timing seams so its reconnect policy can be tested
+	// deterministically without changing renewal or settlement scheduling.
+	receiveJitter         func(time.Duration) time.Duration
+	receiveWait           func(context.Context, time.Duration) bool
 	renewCapabilityMu     sync.Mutex
 	renewBatchUnsupported bool
 	clockWarningOnce      sync.Once
@@ -115,8 +119,6 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 		src:                 src,
 		queue:               queue,
 		cfg:                 cfg,
-		transientBackoff:    500 * time.Millisecond,
-		maxReceiveBackoff:   10 * time.Second,
 		renewRetryBackoff:   100 * time.Millisecond,
 		maxRenewBackoff:     time.Second,
 		settleBackoff:       100 * time.Millisecond,
@@ -124,6 +126,8 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 		settleTimeout:       5 * time.Second,
 		renewAttemptTimeout: defaultRenewAttemptTimeout,
 		jitter:              jitterBackoff,
+		receiveJitter:       jitterBackoff,
+		receiveWait:         waitContext,
 	}
 }
 
@@ -205,6 +209,43 @@ func waitContext(ctx context.Context, delay time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// receiveRetryDelay returns the wait before replaying the current Receive
+// attempt. The first transient failure is replayed immediately to recover a
+// response that may have been lost after the broker committed the claim. Later
+// generated delays use equal-jitter exponential backoff capped at three seconds.
+// A valid Retry-After from HTTP 429/503 is a lower bound, not part of that cap.
+func (r *Receiver) receiveRetryDelay(failures int, err error) time.Duration {
+	delay := time.Duration(0)
+	if failures > 1 {
+		nominal := exponentialBackoff(receiveBackoffBase, receiveBackoffMax, failures-2)
+		delay = r.receiveJitter(nominal)
+		if delay < 0 {
+			delay = 0
+		}
+		if delay > receiveBackoffMax {
+			delay = receiveBackoffMax
+		}
+	}
+	if hint, ok := managedReceiveRetryAfter(err); ok && hint > delay {
+		return hint
+	}
+	return delay
+}
+
+// managedReceiveRetryAfter returns a private server pacing hint only for the
+// statuses whose HTTP semantics permit it here. Renew and settlement retry
+// paths intentionally do not consult this metadata.
+func managedReceiveRetryAfter(err error) (time.Duration, bool) {
+	var responseErr *HTTPError
+	if !errors.As(err, &responseErr) || responseErr == nil || !responseErr.retryAfterOK {
+		return 0, false
+	}
+	if responseErr.StatusCode != 429 && responseErr.StatusCode != 503 {
+		return 0, false
+	}
+	return responseErr.retryAfter, true
 }
 
 func retryableOperationError(err error) bool {
@@ -340,15 +381,11 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			}
 			hadTransientFailure = true
 			failures++
-			if failures == 1 {
-				// A single lost response is commonly recovered by an immediate replay
-				// of the same attempt. Preserve the existing fast path and keep it
-				// silent when that replay succeeds.
-				continue
+			if failures > 1 {
+				r.notify(err)
 			}
-			r.notify(err)
-			delay := r.jitter(exponentialBackoff(r.transientBackoff, r.maxReceiveBackoff, failures-2))
-			if !waitContext(runCtx, delay) {
+			delay := r.receiveRetryDelay(failures, err)
+			if !r.receiveWait(runCtx, delay) {
 				break
 			}
 			// Keep the exact request, including receive_attempt_id, across the

@@ -127,6 +127,16 @@ When a broker or intermediary returns HTTP 499 for a managed request, the
 Receiver treats that response as transient only while its own controlling
 context remains live. Receive reuses the same attempt ID; canceling the caller
 context never triggers another request.
+Managed Receive gives the first transient failure in a round no client-generated
+delay and replays it with that same attempt ID. Later failures use equal-jitter
+exponential delays with a 500ms base and a three-second generated cap. A valid
+`Retry-After` value on HTTP 429 or 503 is a lower bound for any retry and may
+exceed three seconds. HTTP-date values use the `Date` header from the same
+response as their clock reference, falling back to local response receipt time
+when that header is absent or malformed. `Retry-After: 0` never suppresses the
+normal later backoff. Canceling `Run` interrupts every reconnect wait. A
+successful Receive, including an empty result, ends the retry round; the next
+Receive uses a fresh attempt ID.
 
 ## Topics and subscriptions
 
@@ -253,6 +263,11 @@ replayable with the same attempt ID. The managed receiver replays only exact
 fenced renewal, Complete, or Abandon requests within its retry budget.
 HTTP 499 from a broker or intermediary is retryable in these managed loops only
 while their controlling context remains live; caller cancellation is not replayed.
+Managed Receive bounds reconnect latency with no client-generated delay on the
+first replay, followed by equal-jitter exponential delays (500ms base,
+three-second generated cap). HTTP 429 and 503 may raise any individual delay
+through `Retry-After`; they never change the attempt ID, and cancellation
+interrupts the wait.
 
 `Receiver.Run` always uses Peek-Lock and replays an identical Complete or
 Abandon request for up to five seconds after a retryable failure. A process
