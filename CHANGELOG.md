@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Bound managed Receive reconnection: keep one receive-attempt ID, replay the
+  first transient failure with no client-generated delay, then use equal-jitter
+  exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
+  hints on HTTP 429 and 503 are delay lower bounds and may exceed that cap;
+  cancellation remains immediately interruptible.
 - Reject negative and sub-second nonzero queue lock durations before sending a
   CreateQueue request. Zero still selects the broker's documented default.
 - Make managed delivery recovery exact: retain one receive-attempt ID across

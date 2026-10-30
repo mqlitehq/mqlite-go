@@ -93,6 +93,98 @@ func TestLeaseObservationIsScopedToProducingResponse(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	base := time.Date(2026, time.October, 30, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		retryAfter string
+		date       string
+		receivedAt time.Time
+		want       time.Duration
+		wantOK     bool
+	}{
+		{name: "delta seconds", retryAfter: "7", receivedAt: base, want: 7 * time.Second, wantOK: true},
+		{name: "zero delta", retryAfter: "0", receivedAt: base, wantOK: true},
+		{
+			name:       "HTTP date uses response Date",
+			retryAfter: base.Add(9 * time.Second).Format(http.TimeFormat),
+			date:       base.Format(http.TimeFormat),
+			receivedAt: base.Add(time.Hour),
+			want:       9 * time.Second,
+			wantOK:     true,
+		},
+		{
+			name:       "HTTP date falls back to receipt time",
+			retryAfter: base.Add(4 * time.Second).Format(http.TimeFormat),
+			receivedAt: base,
+			want:       4 * time.Second,
+			wantOK:     true,
+		},
+		{
+			name:       "HTTP date ignores malformed response Date",
+			retryAfter: base.Add(6 * time.Second).Format(http.TimeFormat),
+			date:       "not-a-date",
+			receivedAt: base,
+			want:       6 * time.Second,
+			wantOK:     true,
+		},
+		{name: "malformed", retryAfter: "eventually", receivedAt: base},
+		{name: "signed delta", retryAfter: "+1", receivedAt: base},
+		{name: "negative delta", retryAfter: "-1", receivedAt: base},
+		{name: "fractional delta", retryAfter: "1.5", receivedAt: base},
+		{name: "overflowing delta", retryAfter: "9223372037", receivedAt: base},
+		{
+			name:       "past HTTP date",
+			retryAfter: base.Add(-time.Second).Format(http.TimeFormat),
+			date:       base.Format(http.TimeFormat),
+			receivedAt: base,
+		},
+		{
+			name:       "overflowing HTTP date",
+			retryAfter: "Fri, 31 Dec 9999 23:59:59 GMT",
+			date:       base.Format(http.TimeFormat),
+			receivedAt: base,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			header := make(http.Header)
+			header.Set("Retry-After", test.retryAfter)
+			if test.date != "" {
+				header.Set("Date", test.date)
+			}
+			got, ok := parseRetryAfter(header, test.receivedAt)
+			if ok != test.wantOK || got != test.want {
+				t.Fatalf("parseRetryAfter() = (%s, %t), want (%s, %t)", got, ok, test.want, test.wantOK)
+			}
+		})
+	}
+}
+
+func TestHTTPErrorRetainsPrivateRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "resource_exhausted", Message: "slow down"})
+	}))
+	defer server.Close()
+
+	client, err := Open(context.Background(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, err = client.Receive(context.Background(), "jobs")
+	var responseErr *HTTPError
+	if !errors.As(err, &responseErr) {
+		t.Fatalf("Receive error = %v, want HTTPError", err)
+	}
+	if responseErr.StatusCode != http.StatusTooManyRequests || !responseErr.retryAfterOK || responseErr.retryAfter != 7*time.Second {
+		t.Fatalf("HTTPError = status %d retryAfter (%s, %t)", responseErr.StatusCode, responseErr.retryAfter, responseErr.retryAfterOK)
+	}
+}
+
 func TestParseDSNContract(t *testing.T) {
 	tests := []struct {
 		name         string

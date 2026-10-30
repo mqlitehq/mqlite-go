@@ -289,9 +289,7 @@ func TestReceiverRetryReusesAttemptIDAndCompletes(t *testing.T) {
 	receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) {
 		atomic.AddInt32(&observed, 1)
 	})})
-	receiver.transientBackoff = time.Millisecond
-	receiver.maxReceiveBackoff = 4 * time.Millisecond
-	receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
 	err := receiver.Run(ctx, func(context.Context, *Message) error {
 		cancel()
 		return nil
@@ -332,9 +330,10 @@ func TestReceiverRetryKeepsAttemptIDAcrossBackoff(t *testing.T) {
 	receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) {
 		atomic.AddInt32(&observed, 1)
 	})})
-	receiver.transientBackoff = time.Millisecond
-	receiver.maxReceiveBackoff = 4 * time.Millisecond
-	receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		return ctx.Err() == nil
+	}
 	err := receiver.Run(ctx, func(context.Context, *Message) error {
 		cancel()
 		return nil
@@ -356,6 +355,174 @@ func TestReceiverRetryKeepsAttemptIDAcrossBackoff(t *testing.T) {
 	}
 }
 
+func TestReceiverRetryUsesBoundedDelayVectorAndOneAttemptID(t *testing.T) {
+	permanent := &HTTPError{StatusCode: http.StatusForbidden, cause: ErrPermissionDenied}
+	source := &fakeReceiveSource{}
+	source.receiveFn = func(context.Context, int, receiveRecord) ([]*Message, error) {
+		if len(source.receiveSnapshot()) <= 6 {
+			return nil, errors.New("lost receive response")
+		}
+		return nil, permanent
+	}
+	receiver := newReceiver(source, "jobs", nil)
+	var generated []time.Duration
+	receiver.receiveJitter = func(delay time.Duration) time.Duration {
+		generated = append(generated, delay)
+		return delay
+	}
+	var waits []time.Duration
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		return ctx.Err() == nil
+	}
+
+	err := receiver.Run(context.Background(), func(context.Context, *Message) error { return nil })
+	if err != permanent {
+		t.Fatalf("Run error = %v, want %v", err, permanent)
+	}
+	wantWaits := []time.Duration{0, 500 * time.Millisecond, time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}
+	if !equalDurations(waits, wantWaits) {
+		t.Fatalf("retry waits = %v, want %v", waits, wantWaits)
+	}
+	wantGenerated := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}
+	if !equalDurations(generated, wantGenerated) {
+		t.Fatalf("generated delays = %v, want %v", generated, wantGenerated)
+	}
+	receives := source.receiveSnapshot()
+	if len(receives) != 7 {
+		t.Fatalf("receive calls = %+v, want six transient failures and one permanent failure", receives)
+	}
+	for i := 1; i < len(receives); i++ {
+		if receives[i].attemptID != receives[0].attemptID {
+			t.Fatalf("AttemptID changed at call %d: %+v", i+1, receives)
+		}
+	}
+}
+
+func TestReceiverRetryUsesOnlyValid429And503Hints(t *testing.T) {
+	permanent := &HTTPError{StatusCode: http.StatusForbidden, cause: ErrPermissionDenied}
+	errorsByCall := []error{
+		&HTTPError{StatusCode: http.StatusServiceUnavailable, cause: errors.New("draining"), retryAfter: 8 * time.Second, retryAfterOK: true},
+		&HTTPError{StatusCode: http.StatusServiceUnavailable, cause: errors.New("retry now"), retryAfterOK: true},
+		&HTTPError{StatusCode: http.StatusTooManyRequests, cause: errors.New("rate limited"), retryAfter: 1500 * time.Millisecond, retryAfterOK: true},
+		&HTTPError{StatusCode: http.StatusInternalServerError, cause: errors.New("server error"), retryAfter: 9 * time.Second, retryAfterOK: true},
+		&HTTPError{StatusCode: http.StatusServiceUnavailable, cause: errors.New("malformed hint"), retryAfter: 9 * time.Second},
+		permanent,
+	}
+	source := &fakeReceiveSource{}
+	source.receiveFn = func(context.Context, int, receiveRecord) ([]*Message, error) {
+		return nil, errorsByCall[len(source.receiveSnapshot())-1]
+	}
+	receiver := newReceiver(source, "jobs", nil)
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	var waits []time.Duration
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		return ctx.Err() == nil
+	}
+
+	err := receiver.Run(context.Background(), func(context.Context, *Message) error { return nil })
+	if err != permanent {
+		t.Fatalf("Run error = %v, want %v", err, permanent)
+	}
+	want := []time.Duration{8 * time.Second, 500 * time.Millisecond, 1500 * time.Millisecond, 2 * time.Second, 3 * time.Second}
+	if !equalDurations(waits, want) {
+		t.Fatalf("retry waits = %v, want %v", waits, want)
+	}
+}
+
+func TestReceiverRetryWaitStopsOnContextCancellation(t *testing.T) {
+	source := &fakeReceiveSource{}
+	source.receiveFn = func(context.Context, int, receiveRecord) ([]*Message, error) {
+		if len(source.receiveSnapshot()) == 1 {
+			return nil, errors.New("lost receive response")
+		}
+		return nil, &HTTPError{
+			StatusCode:   http.StatusServiceUnavailable,
+			cause:        errors.New("broker is draining"),
+			retryAfter:   time.Hour,
+			retryAfterOK: true,
+		}
+	}
+	backingOff := make(chan struct{}, 1)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) {
+		backingOff <- struct{}{}
+	})})
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- receiver.Run(ctx, func(context.Context, *Message) error { return nil })
+	}()
+	select {
+	case <-backingOff:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("Receiver did not enter retry backoff")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want context.Canceled", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("context cancellation did not interrupt Receive retry wait")
+	}
+	if receives := source.receiveSnapshot(); len(receives) != 2 {
+		t.Fatalf("receive calls = %+v, want immediate replay then canceled wait", receives)
+	}
+}
+
+func TestReceiverSuccessStartsFreshRetryRound(t *testing.T) {
+	permanent := &HTTPError{StatusCode: http.StatusForbidden, cause: ErrPermissionDenied}
+	source := &fakeReceiveSource{}
+	source.receiveFn = func(context.Context, int, receiveRecord) ([]*Message, error) {
+		switch len(source.receiveSnapshot()) {
+		case 1, 3:
+			return nil, errors.New("lost receive response")
+		case 2:
+			return nil, nil
+		default:
+			return nil, permanent
+		}
+	}
+	receiver := newReceiver(source, "jobs", nil)
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	var waits []time.Duration
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		return ctx.Err() == nil
+	}
+
+	err := receiver.Run(context.Background(), func(context.Context, *Message) error { return nil })
+	if err != permanent {
+		t.Fatalf("Run error = %v, want %v", err, permanent)
+	}
+	if want := []time.Duration{0, 0}; !equalDurations(waits, want) {
+		t.Fatalf("retry waits = %v, want %v after success reset", waits, want)
+	}
+	receives := source.receiveSnapshot()
+	if len(receives) != 4 || receives[0].attemptID != receives[1].attemptID || receives[2].attemptID != receives[3].attemptID {
+		t.Fatalf("receive attempts = %+v, want one ID per retry round", receives)
+	}
+	if receives[0].attemptID == receives[2].attemptID {
+		t.Fatalf("successful round reused AttemptID %q", receives[0].attemptID)
+	}
+}
+
+func equalDurations(got, want []time.Duration) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestReceiverRetriesBrokerCanceledReceiveWithSameAttempt(t *testing.T) {
 	source := &fakeReceiveSource{}
 	source.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
@@ -371,7 +538,7 @@ func TestReceiverRetriesBrokerCanceledReceiveWithSameAttempt(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	receiver := newReceiver(source, "jobs", nil)
-	receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
 	err := receiver.Run(ctx, func(context.Context, *Message) error {
 		cancel()
 		return nil
@@ -435,9 +602,16 @@ func TestReceiverSurvivesHTTPDrainAndRestartWithSameAttempt(t *testing.T) {
 		default:
 		}
 	}))
-	receiver.transientBackoff = 5 * time.Millisecond
-	receiver.maxReceiveBackoff = 10 * time.Millisecond
-	receiver.jitter = func(delay time.Duration) time.Duration { return delay }
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	requestedRetryDelay := make(chan time.Duration, 1)
+	var recordFirstWait sync.Once
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		recordFirstWait.Do(func() { requestedRetryDelay <- delay })
+		if delay > 5*time.Millisecond {
+			delay = 5 * time.Millisecond
+		}
+		return waitContext(ctx, delay)
+	}
 	var handlerCalls int32
 	runDone := make(chan error, 1)
 	go func() {
@@ -464,8 +638,19 @@ func TestReceiverSurvivesHTTPDrainAndRestartWithSameAttempt(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first HTTP listener did not stop")
 	}
-	// The first 503 is retried immediately. Wait for the following connection
-	// refusal so this covers an actual broker gap, not two handlers in one process.
+	// Assert the unscaled policy delay before the test seam shortens its physical
+	// wait. The broker's first 503 carries Retry-After: 1, so it overrides the
+	// otherwise immediate first replay.
+	select {
+	case delay := <-requestedRetryDelay:
+		if delay != time.Second {
+			t.Fatalf("first retry delay = %s, want 1s from Retry-After", delay)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not schedule the draining broker retry")
+	}
+	// Wait for the following connection refusal so this covers an actual broker
+	// gap, not two handlers in one process.
 	select {
 	case <-retryObserved:
 	case <-time.After(2 * time.Second):

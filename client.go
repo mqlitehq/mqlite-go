@@ -29,8 +29,10 @@ func (e *invalidSuccessResponseError) Unwrap() error { return e.cause }
 // Use errors.As to inspect it while errors.Is continues to match any wrapped
 // MQLite sentinel.
 type HTTPError struct {
-	StatusCode int
-	cause      error
+	StatusCode   int
+	cause        error
+	retryAfter   time.Duration
+	retryAfterOK bool
 }
 
 func (e *HTTPError) Error() string {
@@ -44,6 +46,16 @@ func (e *HTTPError) Unwrap() error { return e.cause }
 
 // HTTPStatus returns the response status code.
 func (e *HTTPError) HTTPStatus() int { return e.StatusCode }
+
+func httpErrorFromResponse(resp *http.Response, receivedAt time.Time, cause error) *HTTPError {
+	retryAfter, ok := parseRetryAfter(resp.Header, receivedAt)
+	return &HTTPError{
+		StatusCode:   resp.StatusCode,
+		cause:        cause,
+		retryAfter:   retryAfter,
+		retryAfterOK: ok,
+	}
+}
 
 type ambiguousOutcomeError struct {
 	operation string
@@ -303,8 +315,9 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 		}
 		return err
 	}
+	receivedAt := time.Now()
 	if resp.StatusCode/100 == 2 && observation != nil {
-		observed, _ := observeServerTime(resp.Header, started, time.Now())
+		observed, _ := observeServerTime(resp.Header, started, receivedAt)
 		// Even when neither clock header survived an intermediary, retain the
 		// response timestamp and measured RTT. localLeaseDeadline still refuses to
 		// map without serverUpper, while the Receiver can diagnose and enter its
@@ -323,7 +336,7 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 		// Redirect metadata and bodies come from an untrusted intermediary. RPCs
 		// never follow redirects, and ordinary calls expose only the status needed
 		// for stable classification rather than reflecting Location or body text.
-		return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("mqlite: unexpected HTTP redirect %d", resp.StatusCode)}
+		return httpErrorFromResponse(resp, receivedAt, fmt.Errorf("mqlite: unexpected HTTP redirect %d", resp.StatusCode))
 	}
 	if resp.StatusCode/100 != 2 {
 		data, readErr := readResponseBounded(resp.Body, resp.ContentLength, maxErrorBytes)
@@ -333,7 +346,7 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 		}
 		if resp.StatusCode == http.StatusNotFound &&
 			(errorBody.Code == "" || strings.HasPrefix(errorBody.Message, "no such path")) {
-			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
+			return httpErrorFromResponse(resp, receivedAt, fmt.Errorf("%w: %s", ErrUnsupported, path))
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
 			errorBody.Code = "unauthenticated"
@@ -342,12 +355,12 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 			errorBody.Code = "permission_denied"
 		}
 		if path == wire.PathDeleteSubscription && errorBody.Code == "not_found" {
-			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, errorBody.Message)}
+			return httpErrorFromResponse(resp, receivedAt, fmt.Errorf("%w: %s", ErrSubscriptionNotFound, errorBody.Message))
 		}
 		if path == wire.PathSubscribe && errorBody.Code == "resource_exhausted" {
-			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, errorBody.Message)}
+			return httpErrorFromResponse(resp, receivedAt, fmt.Errorf("%w: %s", ErrSubscriptionLimit, errorBody.Message))
 		}
-		return &HTTPError{StatusCode: resp.StatusCode, cause: mapError(resp.StatusCode, errorBody)}
+		return httpErrorFromResponse(resp, receivedAt, mapError(resp.StatusCode, errorBody))
 	}
 
 	if out == nil {
@@ -376,6 +389,62 @@ func (c *Client) postWithObservation(ctx context.Context, path string, body inte
 		return &invalidSuccessResponseError{cause: err}
 	}
 	return nil
+}
+
+// parseRetryAfter accepts both Retry-After forms. It stays transport-private:
+// only managed Receive uses the parsed value, while exact renewal and settlement
+// retry budgets remain unchanged. HTTP-date values are measured from the same
+// response's Date header when available, avoiding local clock skew; local
+// response receipt time is the fallback.
+func parseRetryAfter(header http.Header, receivedAt time.Time) (time.Duration, bool) {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0, false
+	}
+
+	digits := true
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			digits = false
+			break
+		}
+	}
+	if digits {
+		seconds, err := strconv.ParseUint(value, 10, 64)
+		const maxDuration = time.Duration(1<<63 - 1)
+		if err != nil || seconds > uint64(maxDuration/time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	base := receivedAt
+	if responseDate, dateErr := http.ParseTime(header.Get("Date")); dateErr == nil {
+		base = responseDate
+	}
+	if retryAt.Before(base) {
+		return 0, false
+	}
+	seconds := retryAt.Unix() - base.Unix()
+	nanos := int64(retryAt.Nanosecond() - base.Nanosecond())
+	if nanos < 0 {
+		seconds--
+		nanos += int64(time.Second)
+	}
+	if seconds < 0 {
+		return 0, false
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxSeconds := int64(maxDuration / time.Second)
+	maxNanos := int64(maxDuration % time.Second)
+	if seconds > maxSeconds || (seconds == maxSeconds && nanos > maxNanos) {
+		return 0, false
+	}
+	return time.Duration(seconds)*time.Second + time.Duration(nanos), true
 }
 
 // observeServerTime converts broker response time into a conservative upper
