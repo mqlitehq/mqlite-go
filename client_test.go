@@ -104,6 +104,7 @@ func TestParseRetryAfter(t *testing.T) {
 		wantOK     bool
 	}{
 		{name: "delta seconds", retryAfter: "7", receivedAt: base, want: 7 * time.Second, wantOK: true},
+		{name: "large delta remains parser metadata", retryAfter: "3600", receivedAt: base, want: time.Hour, wantOK: true},
 		{name: "zero delta", retryAfter: "0", receivedAt: base, wantOK: true},
 		{
 			name:       "HTTP date uses response Date",
@@ -111,6 +112,14 @@ func TestParseRetryAfter(t *testing.T) {
 			date:       base.Format(http.TimeFormat),
 			receivedAt: base.Add(time.Hour),
 			want:       9 * time.Second,
+			wantOK:     true,
+		},
+		{
+			name:       "distant HTTP date remains parser metadata",
+			retryAfter: base.Add(24 * time.Hour).Format(http.TimeFormat),
+			date:       base.Format(http.TimeFormat),
+			receivedAt: base,
+			want:       24 * time.Hour,
 			wantOK:     true,
 		},
 		{

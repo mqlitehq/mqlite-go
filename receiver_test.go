@@ -431,12 +431,73 @@ func TestReceiverRetryUsesOnlyValid429And503Hints(t *testing.T) {
 	}
 }
 
+func TestReceiverRetryAfterIsBoundedPacing(t *testing.T) {
+	receiver := newReceiver(nil, "jobs", nil)
+	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	tests := []struct {
+		name       string
+		failures   int
+		err        error
+		want       time.Duration
+		wantPacing bool
+	}{
+		{name: "first transport replay", failures: 1, err: errors.New("connection reset")},
+		{name: "first zero hint remains silent and immediate", failures: 1, err: &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfterOK: true}},
+		{name: "first 503 hint", failures: 1, err: &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfter: time.Second, retryAfterOK: true}, want: time.Second, wantPacing: true},
+		{name: "429 hint raises generated delay", failures: 2, err: &HTTPError{StatusCode: http.StatusTooManyRequests, retryAfter: 2 * time.Second, retryAfterOK: true}, want: 2 * time.Second, wantPacing: true},
+		{name: "zero hint does not erase backoff", failures: 2, err: &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfterOK: true}, want: 500 * time.Millisecond},
+		{name: "server hint may exceed generated cap", failures: 5, err: &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfter: 8 * time.Second, retryAfterOK: true}, want: 8 * time.Second, wantPacing: true},
+		{name: "server hint is capped", failures: 1, err: &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfter: time.Hour, retryAfterOK: true}, want: receiveRetryAfterMax, wantPacing: true},
+		{name: "short hint does not lower generated delay", failures: 5, err: &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfter: time.Second, retryAfterOK: true}, want: 3 * time.Second},
+		{name: "500 ignores hint", failures: 2, err: &HTTPError{StatusCode: http.StatusInternalServerError, retryAfter: 8 * time.Second, retryAfterOK: true}, want: 500 * time.Millisecond},
+		{name: "408 ignores hint", failures: 2, err: &HTTPError{StatusCode: http.StatusRequestTimeout, retryAfter: 8 * time.Second, retryAfterOK: true}, want: 500 * time.Millisecond},
+		{name: "missing hint uses generated delay", failures: 3, err: &HTTPError{StatusCode: http.StatusServiceUnavailable}, want: time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, paced := receiver.receiveRetryDelay(test.failures, test.err)
+			if got != test.want || paced != test.wantPacing {
+				t.Fatalf("receiveRetryDelay(%d, %v) = (%s, %t), want (%s, %t)", test.failures, test.err, got, paced, test.want, test.wantPacing)
+			}
+		})
+	}
+
+	receiver.receiveJitter = func(time.Duration) time.Duration { return 30 * time.Second }
+	if got, paced := receiver.receiveRetryDelay(10, errors.New("connection reset")); got != 3*time.Second || paced {
+		t.Fatalf("generated receive delay = (%s, %t), want (3s, false)", got, paced)
+	}
+}
+
+func TestReceiverZeroRetryAfterDoesNotReportFirstFailure(t *testing.T) {
+	first := &HTTPError{StatusCode: http.StatusServiceUnavailable, retryAfterOK: true}
+	terminal := &HTTPError{StatusCode: http.StatusForbidden, cause: ErrPermissionDenied}
+	source := &fakeReceiveSource{}
+	source.receiveFn = func(_ context.Context, _ int, _ receiveRecord) ([]*Message, error) {
+		if len(source.receiveSnapshot()) == 1 {
+			return nil, first
+		}
+		return nil, terminal
+	}
+	var observed []error
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(err error) { observed = append(observed, err) })})
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		if delay != 0 {
+			t.Errorf("first zero-hint delay = %s, want 0", delay)
+		}
+		return ctx.Err() == nil
+	}
+	err := receiver.Run(context.Background(), func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("Run = %v, want ErrPermissionDenied", err)
+	}
+	if len(observed) != 1 || !errors.Is(observed[0], ErrPermissionDenied) {
+		t.Fatalf("observed errors = %v, want only ErrPermissionDenied", observed)
+	}
+}
+
 func TestReceiverRetryWaitStopsOnContextCancellation(t *testing.T) {
 	source := &fakeReceiveSource{}
 	source.receiveFn = func(context.Context, int, receiveRecord) ([]*Message, error) {
-		if len(source.receiveSnapshot()) == 1 {
-			return nil, errors.New("lost receive response")
-		}
 		return nil, &HTTPError{
 			StatusCode:   http.StatusServiceUnavailable,
 			cause:        errors.New("broker is draining"),
@@ -444,23 +505,38 @@ func TestReceiverRetryWaitStopsOnContextCancellation(t *testing.T) {
 			retryAfterOK: true,
 		}
 	}
-	backingOff := make(chan struct{}, 1)
-	receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) {
-		backingOff <- struct{}{}
+	observed := make(chan error, 1)
+	receiver := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(err error) {
+		observed <- err
 	})})
 	receiver.receiveJitter = func(delay time.Duration) time.Duration { return delay }
+	waiting := make(chan time.Duration, 1)
+	receiver.receiveWait = func(ctx context.Context, delay time.Duration) bool {
+		waiting <- delay
+		return waitContext(ctx, delay)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
 		done <- receiver.Run(ctx, func(context.Context, *Message) error { return nil })
 	}()
 	select {
-	case <-backingOff:
-		cancel()
+	case got := <-waiting:
+		if got != receiveRetryAfterMax {
+			cancel()
+			t.Fatalf("Retry-After wait = %s, want %s cap", got, receiveRetryAfterMax)
+		}
 	case <-time.After(time.Second):
 		cancel()
 		t.Fatal("Receiver did not enter retry backoff")
 	}
+	select {
+	case <-observed:
+	default:
+		cancel()
+		t.Fatal("first paced failure was not reported before waiting")
+	}
+	cancel()
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
@@ -469,8 +545,8 @@ func TestReceiverRetryWaitStopsOnContextCancellation(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("context cancellation did not interrupt Receive retry wait")
 	}
-	if receives := source.receiveSnapshot(); len(receives) != 2 {
-		t.Fatalf("receive calls = %+v, want immediate replay then canceled wait", receives)
+	if receives := source.receiveSnapshot(); len(receives) != 1 {
+		t.Fatalf("receive calls = %+v, want one call before canceled paced wait", receives)
 	}
 }
 
@@ -595,8 +671,16 @@ func TestReceiverSurvivesHTTPDrainAndRestartWithSameAttempt(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	pacedObserved := make(chan error, 1)
 	retryObserved := make(chan error, 1)
 	receiver := client.Receiver("jobs", WithErrorHandler(func(err error) {
+		if _, ok := managedReceiveRetryAfter(err); ok {
+			select {
+			case pacedObserved <- err:
+			default:
+			}
+			return
+		}
 		select {
 		case retryObserved <- err:
 		default:
@@ -648,6 +732,11 @@ func TestReceiverSurvivesHTTPDrainAndRestartWithSameAttempt(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Receiver did not schedule the draining broker retry")
+	}
+	select {
+	case <-pacedObserved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not report the first server-paced retry")
 	}
 	// Wait for the following connection refusal so this covers an actual broker
 	// gap, not two handlers in one process.
