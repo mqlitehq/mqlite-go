@@ -108,9 +108,11 @@ minimum renewal interval fail closed rather than hot-looping.
 The no-header fallback has no relative lease duration to prove: preserve either
 time header, or configure the lock well above its 250ms cadence plus network
 latency. New queue configurations must use zero (the broker default) or a lock
-duration of at least 1s; `CreateQueue` rejects shorter values before sending a
-request. Older queues with shorter locks can still exist, and their managed
-deliveries fail closed when the lease cannot be renewed safely.
+duration from 1s through 1h; `CreateQueue` rejects values outside that range
+before sending a request. Older queues outside the range can still exist, and a
+managed delivery on a very short legacy lease fails closed when it cannot be
+renewed safely. Updating a queue changes future lease extensions only; it does
+not shorten a `LockedUntil` deadline already issued to a consumer.
 If no response-time sample yields a usable deadline, a successful renewal still
 releases the handler and the receiver uses a conservative confirmation cadence.
 The first later renewal failure cancels the handler because no safe retry window

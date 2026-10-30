@@ -7,8 +7,10 @@
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
   hints on HTTP 429 and 503 are delay lower bounds and may exceed that cap;
   cancellation remains immediately interruptible.
-- Reject negative and sub-second nonzero queue lock durations before sending a
-  CreateQueue request. Zero still selects the broker's documented default.
+- Reject queue lock durations outside the broker's supported 1-second through
+  1-hour range before sending a CreateQueue request. Zero still selects the
+  broker's documented default, and both range endpoints are valid. This
+  client-side check does not alter an existing queue or a lease already issued.
 - Make managed delivery recovery exact: retain one receive-attempt ID across
   transient retries, replay ambiguous Complete/Abandon operations, retry lease
   renewal within the known lease window, and cancel the message-scoped handler

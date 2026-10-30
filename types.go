@@ -86,7 +86,7 @@ func validateOutMessageTTL(m OutMessage) error {
 
 // QueueConfig configures one queue.
 type QueueConfig struct {
-	LockDuration       time.Duration // 0 -> broker default; otherwise at least 1s
+	LockDuration       time.Duration // 0 -> broker default; otherwise 1s..1h
 	MaxDeliveryCount   int
 	DefaultTTL         time.Duration
 	DeadLetterOnExpire *bool
@@ -97,12 +97,14 @@ type QueueConfig struct {
 	DLQMaxBytes        int64
 }
 
+const (
+	minQueueLockDuration = time.Second
+	maxQueueLockDuration = time.Hour
+)
+
 func (c QueueConfig) validate() error {
-	if c.LockDuration < 0 {
-		return fmt.Errorf("%w: queue lock duration cannot be negative", ErrInvalidArgument)
-	}
-	if c.LockDuration > 0 && c.LockDuration < time.Second {
-		return fmt.Errorf("%w: queue lock duration must be zero (broker default) or at least 1s", ErrInvalidArgument)
+	if c.LockDuration < 0 || c.LockDuration > 0 && (c.LockDuration < minQueueLockDuration || c.LockDuration > maxQueueLockDuration) {
+		return fmt.Errorf("%w: queue lock duration must be zero (30s default) or between 1s and 1h", ErrInvalidArgument)
 	}
 	return nil
 }
