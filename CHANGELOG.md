@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reject negative and sub-second nonzero queue lock durations before sending a
+  CreateQueue request. Zero still selects the broker's documented default.
 - Make managed delivery recovery exact: retain one receive-attempt ID across
   transient retries, replay ambiguous Complete/Abandon operations, retry lease
   renewal within the known lease window, and cancel the message-scoped handler
