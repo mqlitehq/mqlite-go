@@ -18,6 +18,58 @@ import (
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
 
+func TestAbandonRejectsInvalidDurationBeforeRequest(t *testing.T) {
+	var calls int32
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer stub.Close()
+	client, err := Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	for _, delay := range []time.Duration{-time.Second, -time.Nanosecond, time.Nanosecond, time.Millisecond - time.Nanosecond} {
+		if err := client.Message("q", 1, "token").Abandon(context.Background(), AbandonOpts{Delay: delay}); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("Abandon(%s) = %v, want ErrInvalidArgument", delay, err)
+		}
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("invalid delays sent %d HTTP requests", calls)
+	}
+}
+
+func TestAbandonPreservesZeroAndOneMillisecond(t *testing.T) {
+	for _, delay := range []time.Duration{0, time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			var calls int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				var request struct {
+					Delay int64 `json:"delay_ms"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Delay != int64(delay/time.Millisecond) {
+					t.Errorf("delay=%d error=%v", request.Delay, err)
+				}
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			}))
+			defer stub.Close()
+			client, err := Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if err := client.Message("q", 1, "token").Abandon(context.Background(), AbandonOpts{Delay: delay}); err != nil {
+				t.Fatal(err)
+			}
+			if atomic.LoadInt32(&calls) != 1 {
+				t.Fatalf("valid Abandon calls=%d", calls)
+			}
+		})
+	}
+}
+
 func TestCreateQueueRejectsUnsafeLockDurationWithoutRequest(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
