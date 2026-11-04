@@ -327,6 +327,13 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
+	// Deferred delivery is always Peek-Lock, even if another receive option is
+	// also set. Validate ownership before constructing any message handles.
+	if len(option.Pick) > 0 || option.mode() == receivePeekLock {
+		if err := validatePeekLockMessages(response.Messages); err != nil {
+			return nil, err
+		}
+	}
 	return c.messagesFromWire(queue, response.Messages, observation), nil
 }
 
@@ -339,7 +346,21 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	if err != nil {
 		return nil, err
 	}
+	if mode == receivePeekLock {
+		if err := validatePeekLockMessages(response.Messages); err != nil {
+			return nil, err
+		}
+	}
 	return c.messagesFromWire(queue, response.Messages, observation), nil
+}
+
+func validatePeekLockMessages(messages []wire.Message) error {
+	for _, message := range messages {
+		if message.LockToken == "" {
+			return &invalidSuccessResponseError{cause: errors.New("mqlite: peek-lock response contains a message without a lock token")}
+		}
+	}
+	return nil
 }
 
 func (c *Client) messagesFromWire(queue string, messages []wire.Message, observation serverClockObservation) []*Message {

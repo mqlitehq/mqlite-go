@@ -12,6 +12,8 @@ func TestMessageResponseSequenceValidation(t *testing.T) {
 		`{"messages":[null]}`, `{"messages":[{}]}`,
 		`{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`,
 		`{"messages":[{"seq_number":7},null]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"same"},{"seq_number":7,"lock_token":"same"}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"one"},{"seq_number":7,"lock_token":"two"}]}`,
 	} {
 		t.Run("receive "+body, func(t *testing.T) {
 			var response ReceiveResponse

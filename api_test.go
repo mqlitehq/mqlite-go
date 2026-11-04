@@ -19,7 +19,9 @@ import (
 )
 
 func TestRemoteMalformedMessageResponses(t *testing.T) {
-	for _, body := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`, `{"messages":[{"seq_number":7},null]}`} {
+	for _, body := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`, `{"messages":[{"seq_number":7},null]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"same"},{"seq_number":7,"lock_token":"same"}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"one"},{"seq_number":7,"lock_token":"two"}]}`} {
 		for _, atMostOnce := range []bool{false, true} {
 			t.Run(fmt.Sprintf("receive delete=%v %s", atMostOnce, body), func(t *testing.T) {
 				var calls int32
@@ -81,42 +83,126 @@ func TestRemoteMalformedMessageResponses(t *testing.T) {
 }
 
 func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var receives, handlers, completes int32
-	var mu sync.Mutex
-	var attempts []string
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Mqlite-Server-Time-Ms", fmt.Sprint(time.Now().UnixNano()/int64(time.Millisecond)))
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/Receive"):
-			var request struct {
-				Attempt string `json:"receive_attempt_id"`
+	for _, malformed := range []string{
+		`{"messages":[null]}`,
+		`{"messages":[{"seq_number":7}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":7,"lock_token":"token"}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"one"},{"seq_number":7,"lock_token":"two"}]}`,
+	} {
+		t.Run(malformed, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var receives, handlers, completes int32
+			var mu sync.Mutex
+			var attempts []string
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Mqlite-Server-Time-Ms", fmt.Sprint(time.Now().UnixNano()/int64(time.Millisecond)))
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/Receive"):
+					var request struct {
+						Attempt string `json:"receive_attempt_id"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					mu.Lock()
+					attempts = append(attempts, request.Attempt)
+					mu.Unlock()
+					switch atomic.AddInt32(&receives, 1) {
+					case 1:
+						_, _ = io.WriteString(w, malformed)
+					case 2:
+						if atomic.LoadInt32(&handlers) != 0 {
+							t.Error("malformed delivery reached a handler before replay")
+						}
+						_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"body":"","lock_token":"token","delivery_count":1,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
+					default:
+						<-r.Context().Done()
+					}
+				case strings.HasSuffix(r.URL.Path, "/RenewBatch"):
+					_, _ = fmt.Fprintf(w, `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
+				case strings.HasSuffix(r.URL.Path, "/Complete"):
+					var request struct {
+						Token string `json:"lock_token"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					if request.Token != "token" {
+						t.Error("malformed delivery reached settlement")
+					}
+					atomic.AddInt32(&completes, 1)
+					cancel()
+					_, _ = io.WriteString(w, `{"ok":true}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer stub.Close()
+			client, err := Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Error(err)
+			defer client.Close()
+			err = client.Receiver("q", WithConcurrency(2)).Run(ctx, func(_ context.Context, message *Message) error {
+				atomic.AddInt32(&handlers, 1)
+				if message.SequenceNumber != 7 || len(message.Body) != 0 {
+					t.Errorf("invalid dispatch: %+v", message)
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || atomic.LoadInt32(&handlers) != 1 || atomic.LoadInt32(&completes) != 1 {
+				t.Fatalf("Run=%v,handlers=%d,completes=%d", err, handlers, completes)
 			}
 			mu.Lock()
-			attempts = append(attempts, request.Attempt)
-			mu.Unlock()
-			switch atomic.AddInt32(&receives, 1) {
-			case 1:
-				_, _ = io.WriteString(w, `{"messages":[null]}`)
-			case 2:
-				_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"body":"","lock_token":"token","delivery_count":1,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
-			default:
-				<-r.Context().Done()
+			defer mu.Unlock()
+			if len(attempts) < 2 || attempts[0] == "" || attempts[0] != attempts[1] {
+				t.Fatalf("malformed claimed batch lost attempt ID: %q", attempts)
 			}
-		case strings.HasSuffix(r.URL.Path, "/RenewBatch"):
-			_, _ = fmt.Fprintf(w, `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
-		case strings.HasSuffix(r.URL.Path, "/Complete"):
-			atomic.AddInt32(&completes, 1)
-			cancel()
-			_, _ = io.WriteString(w, `{"ok":true}`)
-		default:
-			http.NotFound(w, r)
-		}
+		})
+	}
+}
+
+func TestReceiveLockTokenValidationRespectsMode(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		opts      RecvOpts
+		body      string
+		wantError bool
+	}{
+		{"peek lock", RecvOpts{}, `{"messages":[{"seq_number":7}]}`, true},
+		{"deferred", RecvOpts{Pick: []int64{7}}, `{"messages":[{"seq_number":7}]}`, true},
+		{"deferred remains peek lock", RecvOpts{Pick: []int64{7}, AtMostOnce: true}, `{"messages":[{"seq_number":7}]}`, true},
+		{"valid prefix", RecvOpts{Max: 2}, `{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":8}]}`, true},
+		{"receive delete", RecvOpts{AtMostOnce: true}, `{"messages":[{"seq_number":7,"body":""}]}`, false},
+		{"distinct sequences may share token", RecvOpts{Max: 2}, `{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":8,"lock_token":"token"}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var unexpected int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/Receive") && !strings.HasSuffix(r.URL.Path, "/ReceiveDeferred") {
+					atomic.AddInt32(&unexpected, 1)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer stub.Close()
+			client, err := Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages, err := client.Receive(context.Background(), "q", tc.opts)
+			if (err != nil) != tc.wantError || (tc.wantError && len(messages) != 0) || errors.Is(err, ErrOutcomeUnknown) {
+				t.Fatalf("Receive=(%v,%v), want error=%v before any message handle", messages, err, tc.wantError)
+			}
+			if atomic.LoadInt32(&unexpected) != 0 {
+				t.Fatal("validation issued a settlement")
+			}
+		})
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"messages":[{"seq_number":7,"state":"active"}]}`)
 	}))
 	defer stub.Close()
 	client, err := Open(context.Background(), stub.URL)
@@ -124,20 +210,8 @@ func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	err = client.Receiver("q").Run(ctx, func(_ context.Context, message *Message) error {
-		atomic.AddInt32(&handlers, 1)
-		if message.SequenceNumber != 7 || len(message.Body) != 0 {
-			t.Errorf("invalid dispatch: %+v", message)
-		}
-		return nil
-	})
-	if !errors.Is(err, context.Canceled) || atomic.LoadInt32(&handlers) != 1 || atomic.LoadInt32(&completes) != 1 {
-		t.Fatalf("Run=%v,handlers=%d,completes=%d", err, handlers, completes)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(attempts) < 2 || attempts[0] == "" || attempts[0] != attempts[1] {
-		t.Fatalf("malformed claimed batch lost attempt ID: %q", attempts)
+	if messages, err := client.Peek(context.Background(), "q"); err != nil || len(messages) != 1 {
+		t.Fatalf("tokenless Peek was rejected: messages=%v, err=%v", messages, err)
 	}
 }
 
