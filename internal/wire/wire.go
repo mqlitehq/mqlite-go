@@ -151,10 +151,15 @@ func (r *ReceiveResponse) UnmarshalJSON(data []byte) error {
 	// A null item decodes into a zero-valued Message. Every actual delivery
 	// has a positive sequence, including a valid empty-body delivery. Reject
 	// the whole batch before exposing any prefix to the caller.
+	seen := make(map[int64]bool, len(*raw.Messages))
 	for _, message := range *raw.Messages {
 		if message.SeqNumber <= 0 {
 			return errors.New("mqlite: receive response contains an invalid message sequence")
 		}
+		if seen[message.SeqNumber] {
+			return errors.New("mqlite: receive response contains a repeated message sequence")
+		}
+		seen[message.SeqNumber] = true
 	}
 	r.Messages = *raw.Messages
 	return nil

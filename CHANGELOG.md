@@ -8,11 +8,15 @@
   `--no-ack` continues to print lock tokens without settlement. Document the
   at-least-once boundary when output succeeds but completion or a pipe reader
   later fails.
-- Reject null Receive items and nonpositive delivery sequences before exposing
+- Reject null Receive items, nonpositive or repeated delivery sequences, and
+  Peek-Lock deliveries without a fencing token before exposing
   any part of a batch (MQLITE-153). A damaged receive-and-delete response returns
-  `ErrOutcomeUnknown`; Peek-Lock retains safe same-attempt replay. Reject null or negative
+  `ErrOutcomeUnknown`; managed normal Receive retains safe same-attempt replay.
+  Reject null or negative
   Send/Schedule acknowledgement sequences while preserving legitimate zero
-  results, empty message bodies, and empty Receive lists.
+  results, empty message bodies, empty Receive lists, and tokenless
+  ReceiveAndDelete/Peek responses. Deferred delivery always requires a token;
+  distinct message sequences do not require globally unique tokens.
 - Reject negative or positive sub-millisecond `Message.Abandon` delays before
   sending an HTTP request (MQLITE-156). Zero remains immediate; valid positive
   delays retain their existing millisecond precision and settlement identity.
