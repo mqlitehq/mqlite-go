@@ -18,6 +18,129 @@ import (
 	"github.com/mqlitehq/mqlite-go/internal/wire"
 )
 
+func TestRemoteMalformedMessageResponses(t *testing.T) {
+	for _, body := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`, `{"messages":[{"seq_number":7},null]}`} {
+		for _, atMostOnce := range []bool{false, true} {
+			t.Run(fmt.Sprintf("receive delete=%v %s", atMostOnce, body), func(t *testing.T) {
+				var calls int32
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					atomic.AddInt32(&calls, 1)
+					_, _ = io.WriteString(w, body)
+				}))
+				defer stub.Close()
+				client, err := Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				messages, err := client.Receive(context.Background(), "q", RecvOpts{AtMostOnce: atMostOnce})
+				if err == nil || len(messages) != 0 || errors.Is(err, ErrOutcomeUnknown) != atMostOnce {
+					t.Fatalf("Receive = (%+v,%v), want empty result and uncertainty only for receive-and-delete", messages, err)
+				}
+				if atomic.LoadInt32(&calls) != 1 {
+					t.Fatalf("public Receive silently replayed: calls=%d", calls)
+				}
+			})
+		}
+	}
+	for _, invalidSequence := range []string{"-1", "null"} {
+		for _, operation := range []string{"single", "batch", "schedule"} {
+			t.Run("invalid send "+operation+" "+invalidSequence, func(t *testing.T) {
+				var calls int32
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					atomic.AddInt32(&calls, 1)
+					if operation == "batch" {
+						_, _ = fmt.Fprintf(w, `{"seq_numbers":[7,%s]}`, invalidSequence)
+					} else {
+						_, _ = fmt.Fprintf(w, `{"seq_numbers":[%s]}`, invalidSequence)
+					}
+				}))
+				defer stub.Close()
+				client, err := Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				switch operation {
+				case "single":
+					_, err = client.SendOne(context.Background(), "q", OutMessage{})
+				case "batch":
+					_, err = client.Send(context.Background(), "q", OutMessage{}, OutMessage{})
+				case "schedule":
+					_, err = client.SendOne(context.Background(), "q", OutMessage{}, SendOpts{At: time.Now().Add(time.Hour)})
+				}
+				if !errors.Is(err, ErrOutcomeUnknown) {
+					t.Fatalf("invalid send acknowledgement error=%v, want ErrOutcomeUnknown", err)
+				}
+				if atomic.LoadInt32(&calls) != 1 {
+					t.Fatalf("ambiguous Send silently replayed: calls=%d", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var receives, handlers, completes int32
+	var mu sync.Mutex
+	var attempts []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Mqlite-Server-Time-Ms", fmt.Sprint(time.Now().UnixNano()/int64(time.Millisecond)))
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/Receive"):
+			var request struct {
+				Attempt string `json:"receive_attempt_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			attempts = append(attempts, request.Attempt)
+			mu.Unlock()
+			switch atomic.AddInt32(&receives, 1) {
+			case 1:
+				_, _ = io.WriteString(w, `{"messages":[null]}`)
+			case 2:
+				_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"body":"","lock_token":"token","delivery_count":1,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
+			default:
+				<-r.Context().Done()
+			}
+		case strings.HasSuffix(r.URL.Path, "/RenewBatch"):
+			_, _ = fmt.Fprintf(w, `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
+		case strings.HasSuffix(r.URL.Path, "/Complete"):
+			atomic.AddInt32(&completes, 1)
+			cancel()
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer stub.Close()
+	client, err := Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.Receiver("q").Run(ctx, func(_ context.Context, message *Message) error {
+		atomic.AddInt32(&handlers, 1)
+		if message.SequenceNumber != 7 || len(message.Body) != 0 {
+			t.Errorf("invalid dispatch: %+v", message)
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || atomic.LoadInt32(&handlers) != 1 || atomic.LoadInt32(&completes) != 1 {
+		t.Fatalf("Run=%v,handlers=%d,completes=%d", err, handlers, completes)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attempts) < 2 || attempts[0] == "" || attempts[0] != attempts[1] {
+		t.Fatalf("malformed claimed batch lost attempt ID: %q", attempts)
+	}
+}
+
 func TestCreateQueueRejectsUnsafeLockDurationWithoutRequest(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

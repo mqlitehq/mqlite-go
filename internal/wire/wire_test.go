@@ -7,6 +7,41 @@ import (
 	"testing"
 )
 
+func TestMessageResponseSequenceValidation(t *testing.T) {
+	for _, body := range []string{
+		`{"messages":[null]}`, `{"messages":[{}]}`,
+		`{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`,
+		`{"messages":[{"seq_number":7},null]}`,
+	} {
+		t.Run("receive "+body, func(t *testing.T) {
+			var response ReceiveResponse
+			if err := json.Unmarshal([]byte(body), &response); err == nil {
+				t.Fatalf("invalid receive item accepted: %s", body)
+			}
+		})
+	}
+	for _, body := range []string{`{"messages":[]}`, `{"messages":[{"seq_number":7}]}`, `{"messages":[{"seq_number":7,"body":""}],"future":true}`} {
+		var response ReceiveResponse
+		if err := json.Unmarshal([]byte(body), &response); err != nil {
+			t.Fatalf("valid empty body/list rejected: %s: %v", body, err)
+		}
+	}
+	for _, body := range []string{`{"seq_numbers":[-1]}`, `{"seq_numbers":[0,-1]}`, `{"seq_numbers":[null]}`, `{"seq_numbers":[7,null]}`} {
+		t.Run("send "+body, func(t *testing.T) {
+			var response SendResponse
+			if err := json.Unmarshal([]byte(body), &response); err == nil {
+				t.Fatalf("invalid send sequence accepted: %s", body)
+			}
+		})
+	}
+	for _, body := range []string{`{"seq_numbers":[0]}`, `{"seq_numbers":[7,0]}`} {
+		var response SendResponse
+		if err := json.Unmarshal([]byte(body), &response); err != nil {
+			t.Fatalf("valid topic/dedup zero rejected: %s: %v", body, err)
+		}
+	}
+}
+
 func TestErrorBodyResourceIsAdditive(t *testing.T) {
 	data, err := json.Marshal(ErrorBody{Code: "not_found", Message: "missing", Resource: "queue"})
 	if err != nil {

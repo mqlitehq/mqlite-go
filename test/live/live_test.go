@@ -4,13 +4,98 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mqlitehq/mqlite-go"
 )
+
+func TestBrokerRoundTripCorruptedDelivery(t *testing.T) {
+	endpoint, token := os.Getenv("MQLITE_TEST_ENDPOINT"), os.Getenv("MQLITE_TEST_TOKEN")
+	if endpoint == "" || token == "" {
+		t.Skip("set MQLITE_TEST_ENDPOINT and MQLITE_TEST_TOKEN for the live broker test")
+	}
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatal("invalid test endpoint")
+	}
+	for _, atMostOnce := range []bool{false, true} {
+		t.Run(fmt.Sprint(atMostOnce), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, err := mqlite.Open(ctx, endpoint, mqlite.WithToken(token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			queue := fmt.Sprintf("sdk-corrupt-%d", time.Now().UnixNano())
+			if err := client.CreateQueue(ctx, queue, mqlite.QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+				defer stop()
+				_, _ = client.DeleteQueueWithOptions(cleanupCtx, queue, mqlite.DeleteQueueOpts{Force: true})
+			}()
+			seq, err := client.SendOne(ctx, queue, mqlite.OutMessage{Body: []byte("retained payload")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reverse := httputil.NewSingleHostReverseProxy(target)
+			var receives int32
+			reverse.ModifyResponse = func(resp *http.Response) error {
+				if strings.HasSuffix(resp.Request.URL.Path, "/Receive") && atomic.AddInt32(&receives, 1) == 1 {
+					_ = resp.Body.Close()
+					const damaged = `{"messages":[null]}`
+					resp.Body = io.NopCloser(strings.NewReader(damaged))
+					resp.ContentLength = int64(len(damaged))
+					resp.Header.Set("Content-Length", fmt.Sprint(len(damaged)))
+				}
+				return nil
+			}
+			proxy := httptest.NewServer(reverse)
+			defer proxy.Close()
+			proxied, err := mqlite.Open(ctx, proxy.URL, mqlite.WithToken(token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proxied.Close()
+			opts := mqlite.RecvOpts{AtMostOnce: atMostOnce, Attempt: "corrupted-receive"}
+			messages, err := proxied.Receive(ctx, queue, opts)
+			if err == nil || len(messages) != 0 || errors.Is(err, mqlite.ErrOutcomeUnknown) != atMostOnce {
+				t.Fatalf("corrupted committed receive = (%+v, %v)", messages, err)
+			}
+			stats, err := client.Stats(ctx, queue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if atMostOnce {
+				if stats.Total != 0 {
+					t.Fatalf("receive-and-delete did not commit: %+v", stats)
+				}
+			} else {
+				if stats.Locked != 1 {
+					t.Fatalf("damaged response did not preserve the original claim: %+v", stats)
+				}
+				messages, err = proxied.Receive(ctx, queue, opts)
+				if err != nil || len(messages) != 1 || messages[0].SequenceNumber != seq || messages[0].DeliveryCount != 1 || string(messages[0].Body) != "retained payload" {
+					t.Fatalf("same-attempt recovery = (%+v, %v)", messages, err)
+				}
+				if err := messages[0].Complete(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 func TestBrokerRoundTrip(t *testing.T) {
 	endpoint := os.Getenv("MQLITE_TEST_ENDPOINT")
