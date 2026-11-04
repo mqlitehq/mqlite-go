@@ -147,6 +147,14 @@ func receive(ctx context.Context, client *mqlite.Client, args []string) error {
 	if len(pos) != 1 {
 		return errors.New("usage: mqlitec receive [flags] <queue-or-subscription>")
 	}
+	if !*noAck {
+		// Reject a known unusable output before claiming. A broken pipe can still
+		// appear later, so writing the complete batch below is also a settlement
+		// prerequisite (MQLITE-148).
+		if stdoutUndeliverable(os.Stdout) {
+			return errors.New("stdout is closed or the null device; refusing to auto-acknowledge messages; use --no-ack for diagnostics")
+		}
+	}
 	messages, err := client.Receive(ctx, pos[0], mqlite.RecvOpts{Max: *max, Wait: *wait})
 	if err != nil {
 		return err
@@ -176,15 +184,24 @@ func receive(ctx context.Context, client *mqlite.Client, args []string) error {
 		}
 		if *noAck {
 			items[i].LockToken = message.LockToken()
-			continue
-		}
-		if err := message.Complete(ctx); err != nil {
-			return fmt.Errorf("complete sequence %d: %w", message.SequenceNumber, err)
 		}
 	}
-	return writeJSON(struct {
+	// The caller must receive the entire JSON batch before any Complete request.
+	// A failed or partial output leaves every token locked for ordinary expiry;
+	// treating that output as successful processing would lose the unseen body.
+	if err := writeJSON(struct {
 		Messages []output `json:"messages"`
-	}{Messages: items})
+	}{Messages: items}); err != nil {
+		return err
+	}
+	if !*noAck {
+		for _, message := range messages {
+			if err := message.Complete(ctx); err != nil {
+				return fmt.Errorf("complete sequence %d: %w", message.SequenceNumber, err)
+			}
+		}
+	}
+	return nil
 }
 
 func subscribe(ctx context.Context, client *mqlite.Client, args []string) error {
