@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Reject null Receive items, nonpositive or repeated delivery sequences, and
+  Peek-Lock deliveries without a fencing token before exposing
+  any part of a batch (MQLITE-153). A damaged receive-and-delete response returns
+  `ErrOutcomeUnknown`; managed normal Receive retains safe same-attempt replay.
+  Reject null or negative
+  Send/Schedule acknowledgement sequences while preserving legitimate zero
+  results, empty message bodies, empty Receive lists, and tokenless
+  ReceiveAndDelete/Peek responses. Deferred delivery always requires a token;
+  distinct message sequences do not require globally unique tokens.
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
