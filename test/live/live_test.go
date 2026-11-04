@@ -18,6 +18,11 @@ import (
 	"github.com/mqlitehq/mqlite-go"
 )
 
+// io.NopCloser is newer than the SDK's Go 1.13 source floor.
+type responseBody struct{ io.Reader }
+
+func (responseBody) Close() error { return nil }
+
 func TestBrokerRoundTripCorruptedDelivery(t *testing.T) {
 	endpoint, token := os.Getenv("MQLITE_TEST_ENDPOINT"), os.Getenv("MQLITE_TEST_TOKEN")
 	if endpoint == "" || token == "" {
@@ -55,7 +60,7 @@ func TestBrokerRoundTripCorruptedDelivery(t *testing.T) {
 				if strings.HasSuffix(resp.Request.URL.Path, "/Receive") && atomic.AddInt32(&receives, 1) == 1 {
 					_ = resp.Body.Close()
 					const damaged = `{"messages":[null]}`
-					resp.Body = io.NopCloser(strings.NewReader(damaged))
+					resp.Body = responseBody{strings.NewReader(damaged)}
 					resp.ContentLength = int64(len(damaged))
 					resp.Header.Set("Content-Length", fmt.Sprint(len(damaged)))
 				}
