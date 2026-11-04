@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Write the complete `mqlitec receive` JSON batch before auto-completing any
+  message (MQLITE-148). Failed or partial stdout writes now leave the batch
+  unsettled; a closed stdout or null-device redirect is refused before claiming.
+  `--no-ack` continues to print lock tokens without settlement. Document the
+  at-least-once boundary when output succeeds but completion or a pipe reader
+  later fails.
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
