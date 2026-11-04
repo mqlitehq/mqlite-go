@@ -117,6 +117,11 @@ Peek-Lock Receive can instead replay the
 same attempt ID. Only the managed receiver automatically retries identical
 fenced renewal, Complete, or Abandon requests.
 
+Receive responses require a positive sequence number for every item. A null item
+invalidates the entire batch before any message is exposed. Empty bodies and
+empty message lists remain valid. Send/Schedule acknowledgements reject null or negative
+sequence numbers but retain zero for topic no-match or skipped batch dedup slots.
+
 `force` is explicit permission to discard retained messages. It changes the
 empty-resource precondition, not the authorization level. A subscription TTL is
 advance authorization for automatic discard at a fixed deadline.
