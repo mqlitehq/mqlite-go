@@ -2,6 +2,7 @@ package mqlite
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -57,11 +58,15 @@ func (m *Message) Complete(ctx context.Context) error {
 }
 
 // Abandon ends this delivery attempt. Below the broker's delivery limit the
-// message becomes available immediately or after the optional delay.
+// message becomes available immediately or after the optional delay. Delay must
+// be zero or at least one millisecond.
 func (m *Message) Abandon(ctx context.Context, opts ...AbandonOpts) error {
 	var opt AbandonOpts
 	if len(opts) > 0 {
 		opt = opts[0]
+	}
+	if opt.Delay < 0 || opt.Delay > 0 && opt.Delay < time.Millisecond {
+		return fmt.Errorf("%w: abandon delay must be zero or at least 1ms", ErrInvalidArgument)
 	}
 	return m.s.abandon(ctx, m.queue, m.SequenceNumber, m.lockToken, durationMillis(opt.Delay))
 }

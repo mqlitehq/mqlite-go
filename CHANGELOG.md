@@ -13,6 +13,9 @@
   `ErrOutcomeUnknown`; Peek-Lock retains safe same-attempt replay. Reject null or negative
   Send/Schedule acknowledgement sequences while preserving legitimate zero
   results, empty message bodies, and empty Receive lists.
+- Reject negative or positive sub-millisecond `Message.Abandon` delays before
+  sending an HTTP request (MQLITE-156). Zero remains immediate; valid positive
+  delays retain their existing millisecond precision and settlement identity.
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
