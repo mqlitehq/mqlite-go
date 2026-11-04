@@ -236,7 +236,9 @@ func TestReceiveCommandOutputFailureDoesNotComplete(t *testing.T) {
 			os.Stdout = writer
 			defer func() { os.Stdout = old }()
 			var completed int32
-			body := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("x"), 128*1024))
+			// Exceed even the usual Linux 1 MiB pipe-capacity ceiling so the
+			// partial reader must close before the complete batch can be written.
+			body := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("x"), 2*1024*1024))
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
