@@ -99,9 +99,11 @@ func (c *Client) SendOne(ctx context.Context, queue string, message OutMessage, 
 	return response.SeqNumbers[0], nil
 }
 
-// Send atomically enqueues one or more messages. An empty batch is a no-op. An
-// invalid successful acknowledgement returns ErrOutcomeUnknown because the
-// batch may already have committed; reconcile before retrying.
+// Send enqueues one or more messages in one transaction. An empty batch is a
+// no-op. With queue deduplication enabled, a conflicting item can return sequence
+// zero while other items commit; inspect every result. An invalid successful
+// acknowledgement returns ErrOutcomeUnknown because the batch may already have
+// committed; reconcile before retrying.
 func (c *Client) Send(ctx context.Context, queue string, messages ...OutMessage) ([]int64, error) {
 	if len(messages) == 0 {
 		return nil, nil
@@ -294,7 +296,9 @@ func (c *Client) renewLease(ctx context.Context, message *Message) (renewalLease
 }
 
 // Receive claims messages with Peek-Lock by default. Pick retrieves deferred
-// sequence numbers, and AtMostOnce uses receive-and-delete.
+// sequence numbers with Peek-Lock even when AtMostOnce is true. Otherwise,
+// AtMostOnce uses receive-and-delete. A call does not retry or renew locks;
+// Receiver.Run provides managed retries and optional renewal.
 func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([]*Message, error) {
 	option := receiveOption(opts)
 	if option.Wait < 0 {

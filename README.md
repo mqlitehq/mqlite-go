@@ -20,12 +20,26 @@ when the application only talks to a broker over HTTP and a low Go floor matters
 go get github.com/mqlitehq/mqlite-go@v0.1.1
 ```
 
+> **Documentation scope:** this README follows unreleased `main`. The install
+> command pins the latest released SDK, v0.1.1; use its
+> [tagged documentation](https://github.com/mqlitehq/mqlite-go/blob/v0.1.1/README.md)
+> for that version. Revised managed retry/renewal behavior, `HTTPError`, stricter
+> acknowledgements, and the queue lock-duration checks below are unreleased.
+> Broker shutdown and lease-preserving startup additionally require a broker
+> implementing those features; a compatible older broker does not acquire them
+> by upgrading its client.
+
 The module declares `go 1.13` and is tested with Go 1.13.15, Go 1.18.10, and
 current stable. Go 1.13 itself is end-of-life: this is a source compatibility
 promise, not a recommendation to build production binaries with an unmaintained
 toolchain. Official `mqlitec` release binaries use a supported current Go stable.
 
 ## Quick start
+
+Start a broker and provision an `orders` queue with a `manage` credential first.
+The client below needs both `send` and `listen`; `Open` parses configuration and
+does not connect to the broker or create resources. Use an operation context
+with a deadline when the application needs a bounded wait.
 
 ```go
 package main
@@ -77,6 +91,13 @@ func main() {
 func process(body []byte) error { return nil }
 ```
 
+Explicit `Receive` and `Message` calls do not automatically renew locks or
+retry operations. For a normal Receive whose response is unavailable, set a
+unique `RecvOpts.Attempt` and reuse it only with the identical request; after a
+valid response, use a new attempt ID. Deferred receive (`Pick`) is a separate
+operation without that replay key. Processing and settlement must fit within
+the issued lease unless the application explicitly renews it.
+
 `Client.Receiver` provides a managed consume loop with bounded concurrency,
 idempotent receive retries, optional lock renewal, and automatic Complete or
 Abandon based on the handler result. `WithConcurrency(C)` limits simultaneous
@@ -125,21 +146,8 @@ the same lock token.
 Complete and Abandon use bounded exact-request retries so a lost broker response
 can be reconciled through the broker's settlement receipt without running the
 handler again.
-When a broker or intermediary returns HTTP 499 for a managed request, the
-Receiver treats that response as transient only while its own controlling
-context remains live. Receive reuses the same attempt ID; canceling the caller
-context never triggers another request.
-Managed Receive gives the first transient failure in a round no client-generated
-delay and replays it with that same attempt ID. Later failures use equal-jitter
-exponential delays with a 500ms base and a three-second generated cap. A valid
-`Retry-After` value on HTTP 429 or 503 may raise one retry delay up to 60 seconds.
-When it raises the generated delay, the error handler is called before waiting,
-including on the first failure. HTTP-date values use the `Date` header from the
-same response as their clock reference, falling back to local response receipt
-time when that header is absent or malformed. `Retry-After: 0` never suppresses
-the normal later backoff. Canceling `Run` interrupts every reconnect wait. A
-successful Receive, including an empty result, ends the retry round; the next
-Receive uses a fresh attempt ID.
+See [Reliability boundary](#reliability-boundary) for reconnect pacing and
+[Stopping managed receivers](#stopping-managed-receivers) for cancellation.
 
 ## Topics and subscriptions
 
@@ -203,10 +211,11 @@ Managed handlers intentionally choose only Complete (`nil`) or immediate
 Abandon (non-nil error). Use an explicit `Receive` loop when one handler needs
 delayed Abandon, Reject, Defer, or receive-and-delete semantics.
 
-Authorization is enforced by the broker. The currently released MQLite v0.4.1
-requires `manage` for subscription provisioning; later broker releases may allow
-`listen` according to their release notes. This SDK does not weaken or emulate
-server permissions.
+Authorization is enforced by the broker. MQLite v0.4.1 requires `manage` for
+subscription provisioning; v0.4.2 also allows broker-wide `listen` credentials
+for subscription creation, filter updates and filter testing. Inventory and
+deletion still require `manage`. This SDK does not weaken or emulate server
+permissions.
 
 ## Included API
 
@@ -265,17 +274,25 @@ receive-and-delete may have removed messages. Peek-Lock Receive remains
 replayable with the same attempt ID. The managed receiver replays only exact
 fenced renewal, Complete, or Abandon requests within its retry budget.
 HTTP 499 from a broker or intermediary is retryable in these managed loops only
-while their controlling context remains live; caller cancellation is not replayed.
+while their controlling context remains live; caller cancellation stops Receive
+retries. Cleanup settlement may still issue requests on its own bounded context.
 Managed Receive bounds reconnect latency with no client-generated delay on the
 first replay, followed by equal-jitter exponential delays (500ms base,
 three-second generated cap). HTTP 429 and 503 may raise any individual delay
 through `Retry-After`, up to 60 seconds; a raised delay is reported before the
 wait. Hints never change the attempt ID, and cancellation interrupts the wait.
+An HTTP-date uses the same response's parseable `Date`, or local response receipt
+time when it is absent or malformed; `Retry-After: 0` never suppresses later
+backoff. A successful Receive, including an empty result, ends that retry round.
 
-`Receiver.Run` always uses Peek-Lock and replays an identical Complete or
-Abandon request for up to five seconds after a retryable failure. A process
-crash, an expired lock, or a settlement outage beyond that bound can still cause
-redelivery rather than silent removal. Explicit
+`Receiver.Run` always uses Peek-Lock. Terminal Complete or Abandon has a
+five-second total budget, including the first request and exact-request retries
+after a retryable failure. This SDK retry budget is separate from the current
+broker's 30-minute settlement receipt retention, measured from recording the
+successful settlement: a replay does not refresh that retention, and resource
+deletion or expiry can end it sooner. See the broker's [settlement contract](https://github.com/mqlitehq/mqlite/blob/main/docs/api-reference.md#complete--abandon--reject--defer--renew).
+A process crash, an expired lock, or a settlement outage beyond the SDK's retry
+bound can still cause redelivery rather than silent removal. Explicit
 `Receive(..., RecvOpts{AtMostOnce: true})`, subscription TTL expiry, force
 deletion, purge, cancel, and configured DLQ retention are deliberate data
 removal boundaries. Message TTL expiry enters the DLQ by default and discards
@@ -283,8 +300,46 @@ only when the queue disables dead-letter-on-expire. A send transport failure can
 be ambiguous, so producers that cannot recreate work should use an application
 outbox and stable message identity; consumers must still be idempotent.
 
+`MessageID` alone does not enable broker deduplication. The default queue
+`DedupWindow` is zero (off), so repeated sends with the same ID are independent
+messages. An administrator can configure a positive window when provisioning the
+queue. The fixed window starts with the first accepted new send for that key;
+repeat hits do not refresh it. Within that window, the same ID and body return
+the original sequence. Only body bytes are compared; subject, properties, and
+other metadata neither participate in that comparison nor overwrite the original
+message. A different body conflicts for a single-message send and produces a
+skipped zero sequence in a multi-message batch. Inspect every batch result. Deduplication
+is bounded by that window and does not make external handler side effects
+exactly-once. Keep the same ID and body when reconciling an ambiguous send; the
+SDK does not automatically replay sends.
+
 All SDK times cross the wire as UTC epoch milliseconds. Resource names are the
 public identity; callers must serialize same-name deletion and recreation.
+
+### Stopping managed receivers
+
+The SDK does not install signal handlers. The application decides when process
+signals or its platform termination budget cancel `Run`. Cancellation stops new
+Receive retries and cancels in-flight handler and renewal contexts immediately;
+it does not offer a grace period for handlers to finish first. `Run` still joins
+handlers, renewals, and terminal settlement before returning. A returning
+handler's `nil` result requests Complete and a non-nil result requests Abandon,
+using up to five seconds on a fresh cleanup context unless a terminal renewal
+failure already made settlement unsafe. An uncooperative handler, error callback,
+or transport can keep that join blocked. A final delivery interrupted by stopping
+can enter the DLQ without a business-handler failure.
+
+`Receiver.Close` is a no-op; `Client.Close` only releases SDK-owned idle HTTP
+connections. Neither stops or joins an active Run. Cancel and join it before
+closing the client. There is no implemented consumer drain/Shutdown API.
+
+Keep Run's context live across a broker replacement if it should reconnect.
+Unreleased broker startup preserves unexpired leases, but both the lease and the
+client's retry budgets still apply. An outage shorter than the lease can still
+outlast the five-second settlement budget. Process death or a pause beyond the
+lease permits redelivery or final-attempt DLQ, and cannot undo external side
+effects. See the broker's [interruption matrix](https://github.com/mqlitehq/mqlite/blob/main/docs/operations.md#consumer-stops-and-host-interruptions)
+for short/long outages, embedded close, sleep, and power-loss boundaries.
 
 ## Documentation
 
