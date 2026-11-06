@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Clarify quick-start queue and permission prerequisites, disabled-by-default
+  deduplication, per-item batch results, broker-version permissions, and owned
+  versus wrapped HTTP transport lifecycles. Distinguish Bearer credentials from
+  the lock tokens intentionally printed by `mqlitec receive --no-ack`.
+
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`

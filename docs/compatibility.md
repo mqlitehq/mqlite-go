@@ -44,8 +44,10 @@ An older broker returns `ErrUnsupported` when a route does not exist. The SDK
 does not silently translate lifecycle calls into a less-safe legacy operation.
 
 Permissions are a broker contract, not a client-side policy. Against v0.4.1,
-subscription creation and filter testing require `manage`. Consult the selected
-broker release notes before assigning a narrower credential.
+subscription creation, filter updates, and filter testing require `manage`.
+v0.4.2 also accepts broker-wide `listen` for these operations; subscription
+inventory and deletion still require `manage`. These credentials authorize the
+whole broker, not one subscription.
 
 ## Stability
 

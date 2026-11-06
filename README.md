@@ -36,6 +36,11 @@ toolchain. Official `mqlitec` release binaries use a supported current Go stable
 
 ## Quick start
 
+Start a broker and provision an `orders` queue with a `manage` credential first.
+The client below needs both `send` and `listen`; `Open` parses configuration and
+does not connect to the broker or create resources. Use an operation context
+with a deadline when the application needs a bounded wait.
+
 ```go
 package main
 
@@ -85,6 +90,13 @@ func main() {
 
 func process(body []byte) error { return nil }
 ```
+
+Explicit `Receive` and `Message` calls do not automatically renew locks or
+retry operations. For a normal Receive whose response is unavailable, set a
+unique `RecvOpts.Attempt` and reuse it only with the identical request; after a
+valid response, use a new attempt ID. Deferred receive (`Pick`) is a separate
+operation without that replay key. Processing and settlement must fit within
+the issued lease unless the application explicitly renews it.
 
 `Client.Receiver` provides a managed consume loop with bounded concurrency,
 idempotent receive retries, optional lock renewal, and automatic Complete or
@@ -273,16 +285,33 @@ An HTTP-date uses the same response's parseable `Date`, or local response receip
 time when it is absent or malformed; `Retry-After: 0` never suppresses later
 backoff. A successful Receive, including an empty result, ends that retry round.
 
-`Receiver.Run` always uses Peek-Lock and replays an identical Complete or
-Abandon request for up to five seconds after a retryable failure. A process
-crash, an expired lock, or a settlement outage beyond that bound can still cause
-redelivery rather than silent removal. Explicit
+`Receiver.Run` always uses Peek-Lock. Terminal Complete or Abandon has a
+five-second total budget, including the first request and exact-request retries
+after a retryable failure. This SDK retry budget is separate from the current
+broker's 30-minute settlement receipt retention, measured from recording the
+successful settlement: a replay does not refresh that retention, and resource
+deletion or expiry can end it sooner. See the broker's [settlement contract](https://github.com/mqlitehq/mqlite/blob/main/docs/api-reference.md#complete--abandon--reject--defer--renew).
+A process crash, an expired lock, or a settlement outage beyond the SDK's retry
+bound can still cause redelivery rather than silent removal. Explicit
 `Receive(..., RecvOpts{AtMostOnce: true})`, subscription TTL expiry, force
 deletion, purge, cancel, and configured DLQ retention are deliberate data
 removal boundaries. Message TTL expiry enters the DLQ by default and discards
 only when the queue disables dead-letter-on-expire. A send transport failure can
 be ambiguous, so producers that cannot recreate work should use an application
 outbox and stable message identity; consumers must still be idempotent.
+
+`MessageID` alone does not enable broker deduplication. The default queue
+`DedupWindow` is zero (off), so repeated sends with the same ID are independent
+messages. An administrator can configure a positive window when provisioning the
+queue. The fixed window starts with the first accepted new send for that key;
+repeat hits do not refresh it. Within that window, the same ID and body return
+the original sequence. Only body bytes are compared; subject, properties, and
+other metadata neither participate in that comparison nor overwrite the original
+message. A different body conflicts for a single-message send and produces a
+skipped zero sequence in a multi-message batch. Inspect every batch result. Deduplication
+is bounded by that window and does not make external handler side effects
+exactly-once. Keep the same ID and body when reconciling an ambiguous send; the
+SDK does not automatically replay sends.
 
 All SDK times cross the wire as UTC epoch milliseconds. Resource names are the
 public identity; callers must serialize same-name deletion and recreation.

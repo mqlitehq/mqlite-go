@@ -1,5 +1,10 @@
 # Security model
 
+This document follows unreleased `main`. For the latest released SDK, use the
+[v0.1.1 security model](https://github.com/mqlitehq/mqlite-go/blob/v0.1.1/docs/security.md).
+Client-side renewal, retry, transport ownership, and response checks described
+here do not upgrade the guarantees of an older broker.
+
 ## Credentials and transport
 
 Bearer tokens authorize the whole broker, not an individual queue. Use separate
@@ -22,10 +27,13 @@ roots, proxies, or transport controls. Do not set a short global timeout on that
 client: Receive uses request contexts for long polling. Set deadlines on each
 operation's context instead. Size a custom transport's idle pool to at least the
 managed receiver concurrency plus its effective prefetch; settlement can overlap
-the next claim wave. The SDK default owns a cloned transport with 64 idle
-connections per host. `Client.Close` closes only that SDK-owned pool, never a
-caller-supplied transport. The SDK shallow-clones a supplied `http.Client` to
-enforce no-redirect RPC behavior without mutating the caller's client.
+the next claim wave. When `http.DefaultTransport` is a standard
+`*http.Transport`, the SDK owns a clone with 64 idle connections per host. If the
+application has replaced that global with a wrapper, the SDK preserves the
+wrapper and leaves pool sizing and lifecycle to the application, just as for a
+caller-supplied transport. `Client.Close` closes only the SDK-owned pool. The SDK
+shallow-clones a supplied `http.Client` to enforce no-redirect RPC behavior
+without mutating the caller's client.
 
 A custom `RoundTripper` must not retry queue or subscription deletion: doing so
 would bypass the SDK's at-most-once deletion guard and could act on a later
