@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Give managed Complete and Abandon confirmation a fresh 30-second total budget
+  with fifteen seconds per attempt, so a slow committed request can replay its exact
+  acknowledgement without rerunning the handler. Exhausted transient failures
+  report `ErrOutcomeUnknown` while retaining the last transport or HTTP cause.
+  Shutdown joins this cooperative cleanup even after `Run` cancellation.
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`

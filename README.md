@@ -124,7 +124,14 @@ promptly. The receiver waits for an in-flight renewal to exit before it settles
 the same lock token.
 Complete and Abandon use bounded exact-request retries so a lost broker response
 can be reconciled through the broker's settlement receipt without running the
-handler again.
+handler again. Confirmation has a fresh 30-second total budget, including retry
+waits, with at most fifteen seconds per attempt. A retry is clipped to the
+remaining total budget. It remains independent of `Run`
+cancellation, so shutdown joins that cleanup before returning. A handler or
+custom HTTP transport that ignores context cancellation can still delay shutdown.
+If transient confirmation failures exhaust the budget, the error handler receives
+`ErrOutcomeUnknown` while `errors.Is` and `errors.As` retain the last transport or
+HTTP cause. Definitive failures such as `ErrLockLost` keep their own identity.
 When a broker or intermediary returns HTTP 499 for a managed request, the
 Receiver treats that response as transient only while its own controlling
 context remains live. Receive reuses the same attempt ID; canceling the caller
@@ -273,7 +280,8 @@ through `Retry-After`, up to 60 seconds; a raised delay is reported before the
 wait. Hints never change the attempt ID, and cancellation interrupts the wait.
 
 `Receiver.Run` always uses Peek-Lock and replays an identical Complete or
-Abandon request for up to five seconds after a retryable failure. A process
+Abandon request within a 30-second confirmation budget, with fifteen seconds per
+attempt, after a retryable failure. A process
 crash, an expired lock, or a settlement outage beyond that bound can still cause
 redelivery rather than silent removal. Explicit
 `Receive(..., RecvOpts{AtMostOnce: true})`, subscription TTL expiry, force

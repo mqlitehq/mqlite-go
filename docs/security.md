@@ -90,13 +90,19 @@ Receive, including an empty result, ends that retry round and the next Receive
 uses a fresh attempt ID.
 Every replayed Peek-Lock batch is fenced by one broker renewal before handler
 dispatch, even when continuing auto-renew is disabled. Complete and Abandon then
-replay the exact same fenced request within a five-second bound; matching broker
+replay the exact same fenced request within a fresh 30-second confirmation budget,
+including retry waits, with at most fifteen seconds per attempt; matching broker
 settlement receipts make a lost-response replay idempotent. A handler slot is
 released when the handler returns, while a separate total-in-flight slot remains
 held through renewal shutdown and terminal settlement. The latter is capped at
 concurrency plus effective prefetch (at most twice concurrency), so settlement
 latency can overlap one claim wave without building an unbounded local lock
 queue.
+The confirmation budget is independent of `Run` cancellation, and shutdown joins
+it after a handler returns and renewal stops. These contexts are cooperative:
+custom transports and handlers must honor cancellation. Exhausted transient
+confirmation failures report `ErrOutcomeUnknown` while preserving the last
+transport or HTTP cause; definitive lock-loss or permanent errors remain unchanged.
 
 Queue and subscription deletion are name-addressed destructive operations. The
 SDK disables redirect following for every RPC and never transparently retries
