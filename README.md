@@ -125,7 +125,8 @@ the same lock token.
 Complete and Abandon use bounded exact-request retries so a lost broker response
 can be reconciled through the broker's settlement receipt without running the
 handler again. Confirmation has a fresh 30-second total budget, including retry
-waits, with at most five seconds per attempt. It remains independent of `Run`
+waits, with at most fifteen seconds per attempt. A retry is clipped to the
+remaining total budget. It remains independent of `Run`
 cancellation, so shutdown joins that cleanup before returning. A handler or
 custom HTTP transport that ignores context cancellation can still delay shutdown.
 If transient confirmation failures exhaust the budget, the error handler receives
@@ -279,7 +280,7 @@ through `Retry-After`, up to 60 seconds; a raised delay is reported before the
 wait. Hints never change the attempt ID, and cancellation interrupts the wait.
 
 `Receiver.Run` always uses Peek-Lock and replays an identical Complete or
-Abandon request within a 30-second confirmation budget, with five seconds per
+Abandon request within a 30-second confirmation budget, with fifteen seconds per
 attempt, after a retryable failure. A process
 crash, an expired lock, or a settlement outage beyond that bound can still cause
 redelivery rather than silent removal. Explicit

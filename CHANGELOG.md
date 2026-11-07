@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Give managed Complete and Abandon confirmation a fresh 30-second total budget
-  with five seconds per attempt, so a slow committed request can replay its exact
+  with fifteen seconds per attempt, so a slow committed request can replay its exact
   acknowledgement without rerunning the handler. Exhausted transient failures
   report `ErrOutcomeUnknown` while retaining the last transport or HTTP cause.
   Shutdown joins this cooperative cleanup even after `Run` cancellation.

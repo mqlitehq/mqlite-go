@@ -30,7 +30,7 @@ const (
 	// silently park a long-lived consumer.
 	receiveRetryAfterMax = 60 * time.Second
 	settleTimeout        = 30 * time.Second
-	settleAttemptTimeout = 5 * time.Second
+	settleAttemptTimeout = 15 * time.Second
 )
 
 type receiveSource interface {
@@ -341,7 +341,7 @@ func releaseWorkerPairs(handlerSlots, totalSlots chan struct{}, count int) {
 // observed. It returns ctx.Err() for normal cancellation. Run waits for active
 // handlers, lock renewals, and terminal settlements to exit, so handlers must
 // honor ctx and return. When settlement remains safe, a returning handler gets a
-// fresh 30-second confirmation budget, with at most five seconds per attempt,
+// fresh 30-second confirmation budget, with at most fifteen seconds per attempt,
 // even during shutdown. These cooperative contexts cannot bound a handler or
 // custom HTTP transport that ignores cancellation.
 func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Message) error) error {

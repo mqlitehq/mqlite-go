@@ -4201,11 +4201,69 @@ func TestReceiverSettlementSlowConfirmationBudget(t *testing.T) {
 			if len(source.identities) != 2 || source.identities[0] != source.identities[1] || source.identities[0].op != operation {
 				t.Fatalf("settlement identity changed: %+v", source.identities)
 			}
-			if len(clock.timeouts) != 3 || clock.timeouts[0] != 30*time.Second || clock.timeouts[1] != 5*time.Second || clock.timeouts[2] != 5*time.Second {
-				t.Fatalf("total/attempt budgets=%v, want 30s/5s/5s", clock.timeouts)
+			if len(clock.timeouts) != 3 || clock.timeouts[0] != 30*time.Second || clock.timeouts[1] != 15*time.Second || clock.timeouts[2] != 15*time.Second {
+				t.Fatalf("total/attempt budgets=%v, want 30s/15s/15s", clock.timeouts)
 			}
 			for _, ctx := range clock.contexts {
 				if ctx.Err() == nil {
+					t.Error("confirmation context timer was not released")
+				}
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementEightSecondConfirmationReplay(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			source := settlementBudgetSource()
+			observed, handlers, attempts, effects := 0, 0, 0, 0
+			r := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) { observed++; cancel() })})
+			r.jitter = func(d time.Duration) time.Duration { return d }
+			clock := useSettlementClock(r)
+			start := clock.time()
+			source.settle = func(callCtx context.Context) error {
+				attempts++
+				elapsed := 8 * time.Second
+				if effects == 0 {
+					clock.advance(time.Second)
+					effects++ // the first request commits before its response is lost
+					elapsed -= time.Second
+				}
+				if deadline, ok := callCtx.Deadline(); ok && deadline.Sub(clock.time()) < elapsed {
+					clock.advance(deadline.Sub(clock.time()))
+					return callCtx.Err()
+				}
+				clock.advance(elapsed)
+				if err := callCtx.Err(); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					return io.EOF
+				}
+				cancel()
+				return nil // exact replay confirms the existing receipt
+			}
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				if operation == "abandon" {
+					return errors.New("handler failure")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || observed != 0 || handlers != 1 || attempts != 2 || effects != 1 {
+				t.Fatalf("Run=%v observed=%d handlers=%d attempts=%d effects=%d virtual_elapsed=%s", err, observed, handlers, attempts, effects, clock.time().Sub(start))
+			}
+			if len(source.identities) != 2 || source.identities[0] != source.identities[1] || source.identities[0].op != operation {
+				t.Fatalf("settlement identity changed: %+v", source.identities)
+			}
+			if elapsed := clock.time().Sub(start); elapsed != 16*time.Second+r.settleBackoff {
+				t.Fatalf("virtual elapsed=%s, want two 8-second requests and one retry wait", elapsed)
+			}
+			for _, callCtx := range clock.contexts {
+				if callCtx.Err() == nil {
 					t.Error("confirmation context timer was not released")
 				}
 			}
@@ -4234,7 +4292,7 @@ func TestReceiverSettlementCancellationJoinsConfirmation(t *testing.T) {
 					close(entered)
 					<-release
 				}
-				clock.advance(3 * time.Second)
+				clock.advance(8 * time.Second)
 				if err := callCtx.Err(); err != nil {
 					return err
 				}
@@ -4337,23 +4395,29 @@ func TestReceiverSettlementExhaustionPreservesLastCause(t *testing.T) {
 
 func TestReceiverSettlementAttemptTimeoutAndPermanentBoundary(t *testing.T) {
 	r := newReceiver(nil, "q", nil)
+	r.jitter = func(d time.Duration) time.Duration { return d }
 	clock := useSettlementClock(r)
 	start := clock.time()
 	ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
 	defer cancel()
 	attempts := 0
+	var attemptBudgets []time.Duration
 	err := r.retrySettlement(ctx, func(callCtx context.Context) error {
 		attempts++
 		deadline, _ := callCtx.Deadline()
 		remaining := deadline.Sub(clock.time())
-		if remaining <= 0 || remaining > 5*time.Second {
+		if remaining <= 0 || remaining > 15*time.Second {
 			t.Fatalf("attempt remaining=%s", remaining)
 		}
+		attemptBudgets = append(attemptBudgets, remaining)
 		clock.advance(remaining)
 		return callCtx.Err()
 	})
-	if attempts < 2 || clock.time().Sub(start) != 30*time.Second || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) {
+	if attempts != 2 || clock.time().Sub(start) != 30*time.Second || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("attempts=%d elapsed=%s err=%v", attempts, clock.time().Sub(start), err)
+	}
+	if attemptBudgets[0] != 15*time.Second || attemptBudgets[1] != 15*time.Second-r.settleBackoff {
+		t.Fatalf("blackhole attempt budgets=%v, want first 15s and total-budget-clipped replay", attemptBudgets)
 	}
 	for _, terminal := range []error{ErrLockLost, ErrUnauthenticated, ErrInvalidArgument, &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}} {
 		r := newReceiver(nil, "q", nil)

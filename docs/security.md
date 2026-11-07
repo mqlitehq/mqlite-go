@@ -91,7 +91,7 @@ uses a fresh attempt ID.
 Every replayed Peek-Lock batch is fenced by one broker renewal before handler
 dispatch, even when continuing auto-renew is disabled. Complete and Abandon then
 replay the exact same fenced request within a fresh 30-second confirmation budget,
-including retry waits, with at most five seconds per attempt; matching broker
+including retry waits, with at most fifteen seconds per attempt; matching broker
 settlement receipts make a lost-response replay idempotent. A handler slot is
 released when the handler returns, while a separate total-in-flight slot remains
 held through renewal shutdown and terminal settlement. The latter is capped at
