@@ -492,6 +492,8 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	var cancelRenew context.CancelFunc
 	var renewDone chan error
 	var renewErr error
+	var renewAborted bool
+	var progress renewalProgress
 	deadline, leaseLength := messageLeaseDeadline(message)
 	lease := renewalLease{
 		deadline:         deadline,
@@ -596,8 +598,18 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		renewCtx, cancel := context.WithCancel(ctx)
 		cancelRenew = cancel
 		renewDone = make(chan error, 1)
+		progress = renewalProgress{deadline: deadline, leaseLength: leaseLength, lease: lease}
 		go func() {
-			renewDone <- r.renewLoop(renewCtx, message, cancelHandler, fail, deadline, leaseLength, lease)
+			err, returned := ErrLockLost, false
+			defer func() {
+				if !returned {
+					renewAborted = true
+					cancelHandler()
+				}
+				renewDone <- err
+			}()
+			err = r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, false)
+			returned = true
 		}()
 	}
 	var stopRenewOnce sync.Once
@@ -616,10 +628,13 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	handlerErr := handler(handlerCtx, message)
 	releaseHandler()
 	handlerReleased = true
-	// A lock token must never be renewed concurrently with its terminal
-	// settlement. Stop and join the renew loop before Complete or Abandon.
+	// Join handling renewal before transferring the last confirmed lease into
+	// the independent, bounded settlement phase.
 	stopRenew()
 	if renewErr != nil {
+		if renewAborted {
+			r.notify(fmt.Errorf("%w: handling heartbeat terminated without a result", ErrLockLost))
+		}
 		// The renew loop already canceled the message-scoped handler and reported
 		// the terminal renewal failure. Settling after a known renewal failure can
 		// only race a lost token or repeat the same permanent authorization error.
@@ -629,15 +644,33 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	// the fresh budget also lets a returning handler finish cleanup during shutdown.
 	settleCtx, cancelSettle := r.settlement.withTimeout(context.Background(), r.settlement.totalTimeout)
 	defer cancelSettle()
-	if handlerErr != nil {
-		r.settleWithRetry(settleCtx, func(ctx context.Context) error {
-			return message.Abandon(ctx)
-		}, fail)
-		return
+	stopSettlingRenew := func() {}
+	if r.cfg.autoRenew {
+		renewCtx, cancel := context.WithCancel(settleCtx)
+		var settlingWG sync.WaitGroup
+		settlingWG.Add(1)
+		go func() {
+			defer settlingWG.Done()
+			r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, true)
+		}()
+		var once sync.Once
+		stopSettlingRenew = func() { once.Do(func() { cancel(); settlingWG.Wait() }) }
 	}
-	r.settleWithRetry(settleCtx, func(ctx context.Context) error {
-		return message.Complete(ctx)
-	}, fail)
+	// Run cancellation still cancels a running handler. Once it returned, its
+	// heartbeat shares only the existing settlement confirmation budget.
+	defer stopSettlingRenew()
+	var err error
+	if handlerErr != nil {
+		err = r.retrySettlement(settleCtx, func(ctx context.Context) error {
+			return message.Abandon(ctx)
+		})
+	} else {
+		err = r.retrySettlement(settleCtx, func(ctx context.Context) error {
+			return message.Complete(ctx)
+		})
+	}
+	stopSettlingRenew()
+	r.settleError(err, fail)
 }
 
 func (r *Receiver) settleWithRetry(ctx context.Context, settle func(context.Context) error, fail func(error)) {
@@ -877,7 +910,27 @@ func (r *Receiver) loseLease(cancelHandler context.CancelFunc, cause error) erro
 	return err
 }
 
-func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandler context.CancelFunc, fail func(error), deadline time.Time, leaseLength time.Duration, lease renewalLease) error {
+// renewalProgress is owned by one heartbeat at a time and transferred only
+// after joining it. Public Message metadata remains immutable during renewal.
+type renewalProgress struct {
+	deadline    time.Time
+	leaseLength time.Duration
+	lease       renewalLease
+}
+
+func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandler context.CancelFunc, fail func(error), progress *renewalProgress, settling bool) error {
+	deadline, leaseLength, lease := progress.deadline, progress.leaseLength, progress.lease
+	defer func() { *progress = renewalProgress{deadline: deadline, leaseLength: leaseLength, lease: lease} }()
+	lose := func(cause error) error {
+		if settling {
+			// An already committed settlement makes Renew lose its token before
+			// the acknowledgement or exact receipt replay arrives. The final
+			// settlement alone resolves this: never replace Unknown with loss,
+			// or emit a second loss after an unsuccessful settlement.
+			return nil
+		}
+		return r.loseLease(cancelHandler, cause)
+	}
 	failures := 0
 
 	for {
@@ -888,14 +941,14 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			} else {
 				remaining := time.Until(deadline)
 				if pathologicalExactLease(lease, remaining) {
-					return r.loseLease(cancelHandler, fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
+					return lose(fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
 				}
 				delay = autoRenewInterval(remaining, lease.responseRTT)
 			}
 		} else {
 			remaining := time.Until(deadline) - leaseDeadlineSafety
 			if !deadline.IsZero() && remaining <= 2*minimumRenewRetryHeadroom {
-				return r.loseLease(cancelHandler, ErrLockLost)
+				return lose(ErrLockLost)
 			}
 			delay = r.jitter(exponentialBackoff(r.renewRetryBackoff, r.maxRenewBackoff, failures-1))
 			if !deadline.IsZero() {
@@ -922,7 +975,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 		if attemptErr != nil {
 			// The attempt consumed every locally defensible millisecond. Even a
 			// late transport result cannot restore a safe settlement window.
-			return r.loseLease(cancelHandler, attemptErr)
+			return lose(attemptErr)
 		}
 		if err == nil {
 			failures = 0
@@ -933,7 +986,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			}
 			confirmedDeadline, remaining := anchorLeaseDeadline(lease.deadline)
 			if pathologicalExactLease(lease, remaining) {
-				return r.loseLease(cancelHandler, fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
+				return lose(fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
 			}
 			if remaining > leaseDeadlineSafety {
 				deadline = confirmedDeadline
@@ -953,13 +1006,13 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 				r.stopPermanentRenewal(cancelHandler, err, fail)
 				return err
 			}
-			return r.loseLease(cancelHandler, err)
+			return lose(err)
 		}
 		if deadline.IsZero() {
 			// The last acknowledgement proved ownership, but an unusable remote
 			// deadline gives no local retry budget. Cancel rather than allowing a
 			// second handler to overlap after an unbounded transient outage.
-			return r.loseLease(cancelHandler, err)
+			return lose(err)
 		}
 		failures++
 	}

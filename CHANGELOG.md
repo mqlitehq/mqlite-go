@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- With auto-renew enabled, protect a returned handler's lease through the existing
+  bounded Complete/Abandon confirmation budget, including Run cancellation during
+  settlement. Resolve a post-commit renewal loss through the exact settlement
+  acknowledgement or receipt replay; preserve final errors and Unknown outcomes.
+  Permanent renewal failures still stop receiving immediately.
+
 - Use a valid `X-Mqlite-Server-Elapsed-Ms` response header to exclude broker
   processing from lease clock uncertainty, keeping long polls and storage waits
   from being charged twice. Renewal scheduling retains the full RPC duration.
