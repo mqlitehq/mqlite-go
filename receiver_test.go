@@ -71,6 +71,36 @@ type deadlineLeaseSource struct {
 	renewalLeaseFn func(context.Context, *Message) (renewalLease, error)
 }
 
+// confirmedSubsecondClient observes acceptance at the next renewal boundary:
+// entry after two successful RPCs proves the Receiver consumed both lease ACKs.
+// The observer does not send a third HTTP request or change a returned lease.
+type confirmedSubsecondClient struct {
+	*Client
+	confirmed   int32
+	twoAccepted chan struct{}
+	once        sync.Once
+	single      bool
+	faultHits   int32
+}
+
+func (s *confirmedSubsecondClient) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
+	if atomic.LoadInt32(&s.confirmed) >= 2 {
+		s.once.Do(func() { close(s.twoAccepted) })
+		<-ctx.Done()
+		return renewalLease{}, ctx.Err()
+	}
+	if s.single && atomic.LoadInt32(&s.confirmed) >= 1 {
+		atomic.AddInt32(&s.faultHits, 1)
+		<-ctx.Done()
+		return renewalLease{}, ctx.Err()
+	}
+	lease, err := s.Client.renewLease(ctx, message)
+	if err == nil && ctx.Err() == nil && lease.deadline.After(time.Now().Add(leaseDeadlineSafety)) {
+		atomic.AddInt32(&s.confirmed, 1)
+	}
+	return lease, err
+}
+
 func (s *deadlineLeaseSource) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
 	if s.renewalLeaseFn != nil {
 		return s.renewalLeaseFn(ctx, message)
@@ -2171,54 +2201,139 @@ func TestReceiverUntrustedLeaseRenewalDoesNotSpin(t *testing.T) {
 }
 
 func TestReceiverSubsecondTrustedLeaseRenewsBeforeDeadline(t *testing.T) {
-	var renewCalls int32
-	var receiveCalls int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		now := time.Now()
-		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
-		switch req.URL.Path {
-		case wire.PathReceive:
-			if atomic.AddInt32(&receiveCalls, 1) > 1 {
-				<-req.Context().Done()
+	for _, mode := range []string{"healthy", "single_renewal_negative_control", "expired_response_negative_control"} {
+		t.Run(mode, func(t *testing.T) {
+			var renewCalls, receiveCalls, lateRenewals, expiredFaults, successfulCompletes int32
+			var mu sync.Mutex
+			var lockedUntil time.Time
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				now := time.Now()
+				w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+				switch req.URL.Path {
+				case wire.PathReceive:
+					if atomic.AddInt32(&receiveCalls, 1) > 1 {
+						<-req.Context().Done()
+						return
+					}
+					mu.Lock()
+					lockedUntil = now.Add(120 * time.Millisecond)
+					deadline := lockedUntil
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{SeqNumber: 55, LockToken: "lock-55", LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)}}})
+				case wire.PathRenewBatch:
+					atomic.AddInt32(&renewCalls, 1)
+					mu.Lock()
+					if !now.Before(lockedUntil) {
+						atomic.AddInt32(&lateRenewals, 1)
+						mu.Unlock()
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired"}`))
+						return
+					}
+					if mode == "expired_response_negative_control" {
+						remaining := time.Until(lockedUntil)
+						mu.Unlock()
+						atomic.AddInt32(&expiredFaults, 1)
+						// This response crosses the real lease horizon and must not
+						// satisfy the confirmation oracle. Keep fixture cleanup bounded
+						// even if a disconnected POST's context is not observed yet.
+						timer := time.NewTimer(remaining + 20*time.Millisecond)
+						defer timer.Stop()
+						select {
+						case <-req.Context().Done():
+						case <-timer.C:
+							w.WriteHeader(http.StatusConflict)
+							_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired"}`))
+						}
+						return
+					}
+					lockedUntil = now.Add(120 * time.Millisecond)
+					deadline := lockedUntil
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{SeqNumber: 55, Ok: true, LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)}}})
+				case wire.PathComplete:
+					mu.Lock()
+					valid := now.Before(lockedUntil)
+					mu.Unlock()
+					if !valid {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired before Complete"}`))
+						return
+					}
+					if err := json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true}); err == nil {
+						atomic.AddInt32(&successfulCompletes, 1)
+					}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			source := &confirmedSubsecondClient{Client: client, twoAccepted: make(chan struct{}), single: mode == "single_renewal_negative_control"}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			var observed int32
+			receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+				atomic.AddInt32(&observed, 1)
+				if mode == "healthy" {
+					t.Errorf("short trusted lease renewal: %v", err)
+				}
+			})})
+			accepted := false
+			err = receiver.Run(ctx, func(handlerCtx context.Context, _ *Message) error {
+				watchdog := time.NewTimer(2 * time.Second)
+				defer watchdog.Stop()
+				select {
+				case <-source.twoAccepted:
+					accepted = true
+				case <-handlerCtx.Done():
+				case <-watchdog.C:
+					t.Error("independent confirmation watchdog expired")
+				}
+				cancel()
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error=%v,want context.Canceled", err)
+			}
+			if mode != "healthy" {
+				if atomic.LoadInt32(&successfulCompletes) != 0 {
+					t.Fatal("negative control completed an unconfirmed delivery")
+				}
+				if accepted || atomic.LoadInt32(&source.confirmed) >= 2 {
+					t.Fatal("negative control satisfied the confirmed-renewal oracle")
+				}
+				if atomic.LoadInt32(&observed) == 0 {
+					t.Fatal("unsafe renewal failed without a lease-loss diagnostic")
+				}
+				if mode == "single_renewal_negative_control" && atomic.LoadInt32(&source.faultHits) != 1 {
+					t.Fatal("one-shot renewal fault was not exercised")
+				}
+				if mode == "expired_response_negative_control" && atomic.LoadInt32(&expiredFaults) != 1 {
+					t.Fatal("expired-response fault was not exercised")
+				}
 				return
 			}
-			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
-				SeqNumber: 55, LockToken: "lock-55",
-				LockedUntilMs: now.Add(120*time.Millisecond).UnixNano() / int64(time.Millisecond),
-			}}})
-		case wire.PathRenewBatch:
-			atomic.AddInt32(&renewCalls, 1)
-			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
-				SeqNumber: 55, Ok: true,
-				LockedUntilMs: now.Add(120*time.Millisecond).UnixNano() / int64(time.Millisecond),
-			}}})
-		case wire.PathComplete:
-			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	client, err := Open(context.Background(), server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	receiver := client.Receiver("jobs", WithAutoRenew(), WithErrorHandler(func(err error) {
-		t.Errorf("short trusted lease renewal: %v", err)
-	}))
-	err = receiver.Run(ctx, func(context.Context, *Message) error {
-		time.Sleep(120 * time.Millisecond)
-		cancel()
-		return nil
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run error = %v, want context.Canceled", err)
-	}
-	if got := atomic.LoadInt32(&renewCalls); got < 2 || got > 20 {
-		t.Fatalf("renew calls = %d, want repeated bounded renewal for a real 40ms lease", got)
+			if atomic.LoadInt32(&successfulCompletes) != 1 {
+				t.Fatal("healthy delivery did not complete exactly once within its lease")
+			}
+			if !accepted || atomic.LoadInt32(&source.confirmed) != 2 {
+				t.Fatal("Receiver did not accept two successful lease confirmations")
+			}
+			if got := atomic.LoadInt32(&renewCalls); got != 2 {
+				t.Fatalf("renew calls=%d,want two confirmed bounded renewals for a real 120ms lease", got)
+			}
+			if atomic.LoadInt32(&lateRenewals) != 0 {
+				t.Fatal("renewal arrived outside the previously confirmed lease horizon")
+			}
+			if atomic.LoadInt32(&observed) != 0 {
+				t.Fatal("healthy subsecond lease reported an error")
+			}
+		})
 	}
 }
 
