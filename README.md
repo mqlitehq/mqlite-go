@@ -100,7 +100,8 @@ conservative lower bound already consumed by a long poll gets one bounded
 confirmation before dispatch. Older brokers use the standard HTTP `Date` header.
 Its one-second precision is charged against the lease, and a coarse
 horizon that cannot safely fit that precision plus measured RTT uses bounded
-untrusted confirmation. If an intermediary strips both headers, the SDK reports
+untrusted confirmation. If an intermediary strips both `X-Mqlite-Server-Time-Ms`
+and HTTP `Date`, the SDK reports
 degraded clock mode once through `WithErrorHandler`, confirms the lease before
 dispatch, and keeps using bounded untrusted confirmation instead of scheduling
 from the raw absolute `LockedUntil`. Exact leases too short to support the 50ms
