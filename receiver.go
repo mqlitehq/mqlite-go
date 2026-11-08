@@ -225,6 +225,31 @@ func waitContext(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+// waitRenewal stops an idle heartbeat at an RPC boundary without canceling
+// an already issued request. The request keeps its original ownership watchdog.
+func waitRenewal(ctx context.Context, stop <-chan struct{}, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-stop:
+		return false
+	default:
+	}
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // receiveRetryDelay returns the wait before replaying the current Receive
 // attempt. The first transient failure adds no client-generated delay so a
 // response lost after a committed claim is replayed promptly. Later generated
@@ -491,6 +516,7 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 
 	var cancelRenew context.CancelFunc
 	var renewDone chan error
+	var renewExited, stopHandlingRenew chan struct{}
 	var renewErr error
 	var renewAborted bool
 	var progress renewalProgress
@@ -598,6 +624,7 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		renewCtx, cancel := context.WithCancel(ctx)
 		cancelRenew = cancel
 		renewDone = make(chan error, 1)
+		renewExited, stopHandlingRenew = make(chan struct{}), make(chan struct{})
 		progress = renewalProgress{deadline: deadline, leaseLength: leaseLength, lease: lease}
 		go func() {
 			err, returned := ErrLockLost, false
@@ -607,8 +634,9 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 					cancelHandler()
 				}
 				renewDone <- err
+				close(renewExited)
 			}()
-			err = r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, false)
+			err = r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, false, stopHandlingRenew)
 			returned = true
 		}()
 	}
@@ -628,8 +656,20 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	handlerErr := handler(handlerCtx, message)
 	releaseHandler()
 	handlerReleased = true
-	// Join handling renewal before transferring the last confirmed lease into
-	// the independent, bounded settlement phase.
+	// Start the existing confirmation budget at handler return. Let an issued
+	// renewal finish inside its ownership watchdog and adopt its confirmed lease,
+	// instead of canceling and reissuing the same broker write during handoff.
+	settleCtx, cancelSettle := r.settlement.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancelSettle()
+	if stopHandlingRenew != nil {
+		close(stopHandlingRenew)
+		select {
+		case <-renewExited:
+		case <-ctx.Done():
+		case <-settleCtx.Done():
+		}
+	}
+	// Run cancellation, budget expiry and abnormal exits still cancel and join.
 	stopRenew()
 	if renewErr != nil {
 		if renewAborted {
@@ -641,9 +681,7 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		return
 	}
 	// Match broker settlement receipts by replaying this exact fenced request;
-	// the fresh budget also lets a returning handler finish cleanup during shutdown.
-	settleCtx, cancelSettle := r.settlement.withTimeout(context.Background(), r.settlement.totalTimeout)
-	defer cancelSettle()
+	// the shared confirmation budget also bounds cleanup during shutdown.
 	stopSettlingRenew := func() {}
 	if r.cfg.autoRenew {
 		renewCtx, cancel := context.WithCancel(settleCtx)
@@ -651,7 +689,7 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		settlingWG.Add(1)
 		go func() {
 			defer settlingWG.Done()
-			r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, true)
+			r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, true, nil)
 		}()
 		var once sync.Once
 		stopSettlingRenew = func() { once.Do(func() { cancel(); settlingWG.Wait() }) }
@@ -918,7 +956,7 @@ type renewalProgress struct {
 	lease       renewalLease
 }
 
-func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandler context.CancelFunc, fail func(error), progress *renewalProgress, settling bool) error {
+func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandler context.CancelFunc, fail func(error), progress *renewalProgress, settling bool, stop <-chan struct{}) error {
 	deadline, leaseLength, lease := progress.deadline, progress.leaseLength, progress.lease
 	defer func() { *progress = renewalProgress{deadline: deadline, leaseLength: leaseLength, lease: lease} }()
 	lose := func(cause error) error {
@@ -961,7 +999,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 				}
 			}
 		}
-		if !waitContext(ctx, delay) {
+		if !waitRenewal(ctx, stop, delay) {
 			return nil
 		}
 

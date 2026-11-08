@@ -6,7 +6,10 @@
   bounded Complete/Abandon confirmation budget, including Run cancellation during
   settlement. Resolve a post-commit renewal loss through the exact settlement
   acknowledgement or receipt replay; preserve final errors and Unknown outcomes.
-  Permanent renewal failures still stop receiving immediately.
+  Permanent renewal failures still stop receiving immediately. On normal handler
+  return, join an in-flight renewal and adopt its acknowledgement without
+  canceling and reissuing it. Handoff shares the existing confirmation budget;
+  Run cancellation, budget expiry and abnormal exits still cancel and join it.
 
 - Use a valid `X-Mqlite-Server-Elapsed-Ms` response header to exclude broker
   processing from lease clock uncertainty, keeping long polls and storage waits

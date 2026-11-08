@@ -135,9 +135,12 @@ func (s *blockingRenewSettler) deferMsg(context.Context, string, int64, string) 
 
 func (s *blockingRenewSettler) renew(ctx context.Context, _ string, _ int64, _ string) error {
 	close(s.renewStarted)
-	<-ctx.Done()
-	close(s.renewCanceled)
-	<-s.allowRenewReturn
+	select {
+	case <-ctx.Done():
+		close(s.renewCanceled)
+		<-s.allowRenewReturn
+	case <-s.allowRenewReturn:
+	}
 	s.record("renew returned")
 	return ctx.Err()
 }
@@ -3990,16 +3993,18 @@ func TestReceiverJoinsInFlightRenewBeforeComplete(t *testing.T) {
 	}()
 
 	select {
-	case <-settler.renewCanceled:
+	case <-settler.renewStarted:
 	case <-time.After(time.Second):
 		close(settler.allowRenewReturn)
-		t.Fatal("in-flight renewal did not observe cancellation")
+		t.Fatal("in-flight renewal did not start")
 	}
 
 	settledEarly := false
 	select {
 	case <-settler.completeCalled:
 		settledEarly = true
+	case <-settler.renewCanceled:
+		t.Error("normal handoff canceled a healthy renewal")
 	case <-time.After(20 * time.Millisecond):
 	}
 	close(settler.allowRenewReturn)
