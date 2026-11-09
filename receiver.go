@@ -42,9 +42,8 @@ type renewalLease struct {
 	clockResolution   time.Duration
 	clockUnavailable  bool
 	deadlineUntrusted bool
-	// Legacy Renew returns no deadline. Keep its fixed conservative duration
-	// estimate separate from the current RPC's time-depleted lease window.
-	legacyLeaseEstimate time.Duration
+	// A legacy acknowledgement retains the caller's fixed lease estimate.
+	legacyAcknowledgement bool
 }
 
 type leaseRenewSource interface {
@@ -564,9 +563,8 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		}
 		if remaining > leaseDeadlineSafety {
 			deadline = confirmedDeadline
-			leaseLength = remaining
-			if lease.legacyLeaseEstimate > 0 {
-				leaseLength = lease.legacyLeaseEstimate
+			if !lease.legacyAcknowledgement {
+				leaseLength = remaining
 			}
 			if leaseNeedsUntrustedSchedule(lease, remaining) {
 				deadline = time.Time{}
@@ -828,14 +826,14 @@ func (r *Receiver) renewMessage(ctx context.Context, message *Message, leaseLeng
 	if leaseLength <= 0 {
 		current.deadline = time.Time{}
 		current.deadlineUntrusted = true
-		current.legacyLeaseEstimate = 0
+		current.legacyAcknowledgement = false
 		return current, nil
 	}
 	// Legacy single Renew does not return a deadline. The broker extends by the
 	// queue lock duration; the delivery's initial remaining lease is the safest
 	// estimate available without a management-permission metadata call.
 	current.deadline = started.Add(leaseLength)
-	current.legacyLeaseEstimate = leaseLength
+	current.legacyAcknowledgement = true
 	return current, nil
 }
 
@@ -909,9 +907,8 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			}
 			if remaining > leaseDeadlineSafety {
 				deadline = confirmedDeadline
-				leaseLength = remaining
-				if lease.legacyLeaseEstimate > 0 {
-					leaseLength = lease.legacyLeaseEstimate
+				if !lease.legacyAcknowledgement {
+					leaseLength = remaining
 				}
 				if leaseNeedsUntrustedSchedule(lease, remaining) {
 					deadline = time.Time{}
