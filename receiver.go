@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -29,6 +30,8 @@ const (
 	// Bound one server-paced Receive wait so stale intermediary metadata cannot
 	// silently park a long-lived consumer.
 	receiveRetryAfterMax = 60 * time.Second
+	settleTimeout        = 30 * time.Second
+	settleAttemptTimeout = 15 * time.Second
 )
 
 type receiveSource interface {
@@ -42,10 +45,50 @@ type renewalLease struct {
 	clockResolution   time.Duration
 	clockUnavailable  bool
 	deadlineUntrusted bool
+	// Legacy Renew returns no deadline. Keep its fixed conservative duration
+	// estimate separate from the current RPC's time-depleted lease window.
+	legacyLeaseEstimate time.Duration
 }
 
 type leaseRenewSource interface {
 	renewLease(context.Context, *Message) (renewalLease, error)
+}
+
+type initialRenewalResult struct {
+	lease           renewalLease
+	err, attemptErr error
+}
+
+type initialBatchRenewer interface {
+	renewInitialBatch(context.Context, string, []*Message) ([]initialRenewalResult, error)
+}
+
+// A legacy endpoint confirms the oldest lease first. This barrier ends at the
+// confirmation boundary, so it never serializes user handlers or settlement.
+type initialRenewalPlan struct {
+	result          *initialRenewalResult
+	previous        <-chan struct{}
+	done            chan struct{}
+	once            sync.Once
+	attemptDeadline time.Time
+}
+
+func (p *initialRenewalPlan) release() {
+	if p != nil && p.done != nil {
+		p.once.Do(func() { close(p.done) })
+	}
+}
+
+func (p *initialRenewalPlan) wait(ctx context.Context) bool {
+	if p == nil || p.previous == nil {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-p.previous:
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		return false
+	}
 }
 
 type receiverConfig struct {
@@ -96,16 +139,25 @@ type Receiver struct {
 	maxRenewBackoff     time.Duration
 	settleBackoff       time.Duration
 	maxSettleBackoff    time.Duration
-	settleTimeout       time.Duration
 	renewAttemptTimeout time.Duration
 	jitter              func(time.Duration) time.Duration
 	// Receive has separate timing seams so its reconnect policy can be tested
 	// deterministically without changing renewal or settlement scheduling.
 	receiveJitter         func(time.Duration) time.Duration
 	receiveWait           func(context.Context, time.Duration) bool
+	settlement            settlementTiming
 	renewCapabilityMu     sync.Mutex
 	renewBatchUnsupported bool
 	clockWarningOnce      sync.Once
+}
+
+// settlementTiming keeps confirmation budgets private and lets tests advance
+// request and retry deadlines without sleeping through remote round trips.
+type settlementTiming struct {
+	totalTimeout   time.Duration
+	attemptTimeout time.Duration
+	withTimeout    func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+	wait           func(context.Context, time.Duration) bool
 }
 
 func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiver {
@@ -126,11 +178,11 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 		maxRenewBackoff:     time.Second,
 		settleBackoff:       100 * time.Millisecond,
 		maxSettleBackoff:    time.Second,
-		settleTimeout:       5 * time.Second,
 		renewAttemptTimeout: defaultRenewAttemptTimeout,
 		jitter:              jitterBackoff,
 		receiveJitter:       jitterBackoff,
 		receiveWait:         waitContext,
+		settlement:          settlementTiming{totalTimeout: settleTimeout, attemptTimeout: settleAttemptTimeout, withTimeout: context.WithTimeout, wait: waitContext},
 	}
 }
 
@@ -208,6 +260,31 @@ func waitContext(ctx context.Context, delay time.Duration) bool {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// waitRenewal stops an idle heartbeat at an RPC boundary without canceling
+// an already issued request. The request keeps its original ownership watchdog.
+func waitRenewal(ctx context.Context, stop <-chan struct{}, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-stop:
+		return false
+	default:
+	}
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-stop:
 		return false
 	case <-timer.C:
 		return true
@@ -329,7 +406,10 @@ func releaseWorkerPairs(handlerSlots, totalSlots chan struct{}, count int) {
 // Run processes messages until ctx is canceled or a permanent broker error is
 // observed. It returns ctx.Err() for normal cancellation. Run waits for active
 // handlers, lock renewals, and terminal settlements to exit, so handlers must
-// honor ctx and return.
+// honor ctx and return. When settlement remains safe, a returning handler gets a
+// fresh 30-second confirmation budget, with at most fifteen seconds per attempt,
+// even during shutdown. These cooperative contexts cannot bound a handler or
+// custom HTTP transport that ignores cancellation.
 func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Message) error) error {
 	batch := r.cfg.prefetch
 	if batch <= 0 || batch > r.cfg.concurrency {
@@ -450,22 +530,157 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 
 		releaseWorkerPairs(handlerSlots, totalSlots, reserved-len(messages))
 		forceInitialRenewal := hadTransientFailure
-		for _, message := range messages {
+		plans, preparationErr := r.prepareInitialRenewals(runCtx, messages, forceInitialRenewal)
+		if runCtx.Err() != nil {
+			releaseWorkerPairs(handlerSlots, totalSlots, len(messages))
+			return finish()
+		}
+		if preparationErr != nil {
+			// A whole-batch permanent failure must fence Run before any handler
+			// can run or release capacity for a new claim (MQLITE-183).
+			fail(preparationErr)
+			r.notify(preparationErr)
+			releaseWorkerPairs(handlerSlots, totalSlots, len(messages))
+			return finish()
+		}
+		for i, message := range messages {
 			workers.Add(1)
-			go func(m *Message, forceInitialRenewal bool) {
+			go func(m *Message, forceInitialRenewal bool, plan *initialRenewalPlan) {
 				defer workers.Done()
 				defer func() { <-totalSlots }()
-				r.processWithHandlerRelease(runCtx, m, handler, func() { <-handlerSlots }, fail, forceInitialRenewal)
-			}(message, forceInitialRenewal)
+				r.processWithHandlerRelease(runCtx, m, handler, func() { <-handlerSlots }, fail, forceInitialRenewal, plan)
+			}(message, forceInitialRenewal, plans[i])
 		}
 	}
+}
+
+func initialMessageLease(message *Message) (time.Time, time.Duration, renewalLease, time.Time) {
+	deadline, length := messageLeaseDeadline(message)
+	lease := renewalLease{deadline: deadline, responseRTT: message.leaseResponseRTT,
+		clockResolution: message.leaseClockResolution, clockUnavailable: message.leaseClockUnavailable}
+	initialDeadline := time.Time{}
+	remaining := time.Until(message.localLeaseDeadline)
+	if !message.localLeaseDeadline.IsZero() && remaining > leaseDeadlineSafety && !leaseNeedsUntrustedSchedule(lease, remaining) {
+		initialDeadline = message.localLeaseDeadline
+	}
+	return deadline, length, lease, initialDeadline
+}
+
+// prepareInitialRenewals collapses only the confirmations needed before user
+// dispatch. Background renewals and the handling/settlement handoff are unchanged.
+func (r *Receiver) prepareInitialRenewals(ctx context.Context, messages []*Message, force bool) ([]*initialRenewalPlan, error) {
+	plans := make([]*initialRenewalPlan, len(messages))
+	var selected []*Message
+	var indexes []int
+	pointers := make(map[*Message]bool)
+	sequences := make(map[int64]bool)
+	for i, message := range messages {
+		_, remaining, lease, trustedDeadline := initialMessageLease(message)
+		if !force && !(r.cfg.autoRenew && needsInitialLeaseConfirmation(lease, remaining)) {
+			continue
+		}
+		if pointers[message] || message.SequenceNumber > 0 && sequences[message.SequenceNumber] {
+			return nil, fmt.Errorf("%w: duplicate message in initial confirmation batch", ErrInvalidArgument)
+		}
+		pointers[message] = true
+		sequences[message.SequenceNumber] = true
+		attemptCtx, cancel := r.initialRenewalAttemptContext(ctx, trustedDeadline)
+		deadline, _ := attemptCtx.Deadline()
+		cancel()
+		plans[i] = &initialRenewalPlan{attemptDeadline: deadline}
+		selected = append(selected, message)
+		indexes = append(indexes, i)
+	}
+	if len(selected) < 2 {
+		// Preserve the existing single-message path and its watchdog timing.
+		for _, i := range indexes {
+			plans[i] = nil
+		}
+		return plans, nil
+	}
+	r.renewCapabilityMu.Lock()
+	unsupported := r.renewBatchUnsupported
+	r.renewCapabilityMu.Unlock()
+	if source, ok := r.src.(initialBatchRenewer); ok && !unsupported && len(selected) <= MaxRenewBatch {
+		deadline := plans[indexes[0]].attemptDeadline
+		for _, i := range indexes[1:] {
+			if plans[i].attemptDeadline.Before(deadline) {
+				deadline = plans[i].attemptDeadline
+			}
+		}
+		attemptCtx, cancel := context.WithDeadline(ctx, deadline)
+		results, err := callInitialBatch(attemptCtx, source, r.queue, selected)
+		attemptErr := attemptCtx.Err()
+		cancel()
+		if ctx.Err() != nil {
+			return plans, nil
+		}
+		if errors.Is(err, ErrUnsupported) {
+			r.renewCapabilityMu.Lock()
+			r.renewBatchUnsupported = true
+			r.renewCapabilityMu.Unlock()
+		} else {
+			if err != nil && !retryableRenewError(err) && permanentReceiverError(err) {
+				return plans, err
+			}
+			if err == nil && len(results) != len(selected) {
+				err = fmt.Errorf("mqlite: initial renewal returned %d results for %d messages", len(results), len(selected))
+			}
+			for n, i := range indexes {
+				result := initialRenewalResult{err: err, attemptErr: attemptErr}
+				if err == nil {
+					result = results[n]
+					result.attemptErr = attemptErr
+				}
+				if result.err != nil && !retryableRenewError(result.err) && permanentReceiverError(result.err) {
+					return plans, result.err
+				}
+				plans[i].result = &result
+			}
+			return plans, nil
+		}
+	}
+	// Unsupported/custom sources retain the old per-item protocol. Stable
+	// deadline ordering spends each original watchdog while waiting its turn.
+	sort.SliceStable(indexes, func(i, j int) bool {
+		return plans[indexes[i]].attemptDeadline.Before(plans[indexes[j]].attemptDeadline)
+	})
+	var previous <-chan struct{}
+	for _, i := range indexes {
+		plans[i].previous = previous
+		plans[i].done = make(chan struct{})
+		previous = plans[i].done
+	}
+	return plans, nil
+}
+
+func callInitialBatch(ctx context.Context, source initialBatchRenewer, queue string, messages []*Message) ([]initialRenewalResult, error) {
+	type outcome struct {
+		results []initialRenewalResult
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result := outcome{err: fmt.Errorf("%w: initial batch confirmation terminated without a result", ErrLockLost)}
+		// A transport's Goexit must not strand Run. Panics retain their existing
+		// behavior; cooperative cancellation still joins the actual invocation.
+		defer func() { done <- result }()
+		result.results, result.err = source.renewInitialBatch(ctx, queue, messages)
+	}()
+	result := <-done
+	return result.results, result.err
 }
 
 func (r *Receiver) process(ctx context.Context, message *Message, handler func(context.Context, *Message) error, fail func(error)) {
 	r.processWithHandlerRelease(ctx, message, handler, func() {}, fail, false)
 }
 
-func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Message, handler func(context.Context, *Message) error, releaseHandler func(), fail func(error), forceInitialRenewal bool) {
+func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Message, handler func(context.Context, *Message) error, releaseHandler func(), fail func(error), forceInitialRenewal bool, initial ...*initialRenewalPlan) {
+	var plan *initialRenewalPlan
+	if len(initial) != 0 {
+		plan = initial[0]
+	}
+	defer plan.release()
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	defer cancelHandler()
 	handlerReleased := false
@@ -477,28 +692,14 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 
 	var cancelRenew context.CancelFunc
 	var renewDone chan error
+	var renewExited, stopHandlingRenew chan struct{}
 	var renewErr error
-	deadline, leaseLength := messageLeaseDeadline(message)
-	lease := renewalLease{
-		deadline:         deadline,
-		responseRTT:      message.leaseResponseRTT,
-		clockResolution:  message.leaseClockResolution,
-		clockUnavailable: message.leaseClockUnavailable,
-	}
+	var renewAborted bool
+	var progress renewalProgress
+	deadline, leaseLength, lease, initialAttemptDeadline := initialMessageLease(message)
 	r.notifyDegradedClock(lease.clockUnavailable)
 	if ctx.Err() != nil {
 		return
-	}
-	initialAttemptDeadline := time.Time{}
-	initialRemaining := time.Until(message.localLeaseDeadline)
-	if !message.localLeaseDeadline.IsZero() && initialRemaining > leaseDeadlineSafety &&
-		!leaseNeedsUntrustedSchedule(lease, initialRemaining) {
-		// A still-usable mapped horizon is a hard ownership boundary even when
-		// measured RTT makes us renew immediately. A horizon already inside the
-		// safety window may only be a conservative long-poll lower bound: probe it
-		// under the bounded untrusted watchdog before rejecting a freshly claimed
-		// token.
-		initialAttemptDeadline = message.localLeaseDeadline
 	}
 	if forceInitialRenewal {
 		// A response replay still needs a broker fence even when the response
@@ -523,10 +724,28 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		// it synchronously before dispatch. Without an exact mapped horizon, the
 		// request watchdog is independent of the untrusted renewal cadence so
 		// ordinary cross-region RTT does not look like immediate lock loss.
-		attemptCtx, cancelAttempt := r.initialRenewalAttemptContext(ctx, initialAttemptDeadline)
-		renewed, err := r.renewMessage(attemptCtx, message, leaseLength, lease)
-		attemptErr := attemptCtx.Err()
-		cancelAttempt()
+		var renewed renewalLease
+		var err, attemptErr error
+		if plan != nil && plan.result != nil {
+			renewed, err, attemptErr = plan.result.lease, plan.result.err, plan.result.attemptErr
+		} else {
+			var attemptCtx context.Context
+			var cancelAttempt context.CancelFunc
+			if plan != nil {
+				attemptCtx, cancelAttempt = context.WithDeadline(ctx, plan.attemptDeadline)
+			} else {
+				attemptCtx, cancelAttempt = r.initialRenewalAttemptContext(ctx, initialAttemptDeadline)
+			}
+			defer cancelAttempt()
+			if plan.wait(attemptCtx) {
+				renewed, err = r.renewMessage(attemptCtx, message, leaseLength, lease)
+			}
+			attemptErr = attemptCtx.Err()
+			cancelAttempt()
+		}
+		if attemptErr != nil || err == nil || retryableRenewError(err) || !permanentReceiverError(err) {
+			plan.release()
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -540,7 +759,10 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 					r.stopPermanentRenewal(cancelHandler, err, fail)
 					return
 				}
-				r.loseLease(cancelHandler, err)
+				// A definitive protocol/configuration rejection keeps its cause;
+				// it does not prove that the broker rejected this lock token.
+				cancelHandler()
+				r.notify(err)
 				return
 			}
 			// There is no trustworthy lease window in which to back off. Match
@@ -562,6 +784,9 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		if remaining > leaseDeadlineSafety {
 			deadline = confirmedDeadline
 			leaseLength = remaining
+			if lease.legacyLeaseEstimate > 0 {
+				leaseLength = lease.legacyLeaseEstimate
+			}
 			if leaseNeedsUntrustedSchedule(lease, remaining) {
 				deadline = time.Time{}
 				leaseLength = 0
@@ -582,8 +807,20 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 		renewCtx, cancel := context.WithCancel(ctx)
 		cancelRenew = cancel
 		renewDone = make(chan error, 1)
+		renewExited, stopHandlingRenew = make(chan struct{}), make(chan struct{})
+		progress = renewalProgress{deadline: deadline, leaseLength: leaseLength, lease: lease}
 		go func() {
-			renewDone <- r.renewLoop(renewCtx, message, cancelHandler, fail, deadline, leaseLength, lease)
+			err, returned := ErrLockLost, false
+			defer func() {
+				if !returned {
+					renewAborted = true
+					cancelHandler()
+				}
+				renewDone <- err
+				close(renewExited)
+			}()
+			err = r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, false, stopHandlingRenew)
+			returned = true
 		}()
 	}
 	var stopRenewOnce sync.Once
@@ -602,46 +839,99 @@ func (r *Receiver) processWithHandlerRelease(ctx context.Context, message *Messa
 	handlerErr := handler(handlerCtx, message)
 	releaseHandler()
 	handlerReleased = true
-	// A lock token must never be renewed concurrently with its terminal
-	// settlement. Stop and join the renew loop before Complete or Abandon.
+	// Start the existing confirmation budget at handler return. Let an issued
+	// renewal finish inside its ownership watchdog and adopt its confirmed lease,
+	// instead of canceling and reissuing the same broker write during handoff.
+	settleCtx, cancelSettle := r.settlement.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancelSettle()
+	if stopHandlingRenew != nil {
+		close(stopHandlingRenew)
+		select {
+		case <-renewExited:
+		case <-ctx.Done():
+		case <-settleCtx.Done():
+		}
+	}
+	// Run cancellation, budget expiry and abnormal exits still cancel and join.
 	stopRenew()
 	if renewErr != nil {
+		if renewAborted {
+			r.notify(fmt.Errorf("%w: handling heartbeat terminated without a result", ErrLockLost))
+		}
 		// The renew loop already canceled the message-scoped handler and reported
 		// the terminal renewal failure. Settling after a known renewal failure can
 		// only race a lost token or repeat the same permanent authorization error.
 		return
 	}
-	settleCtx, cancelSettle := context.WithTimeout(context.Background(), r.settleTimeout)
-	defer cancelSettle()
-	if handlerErr != nil {
-		r.settleWithRetry(settleCtx, func(ctx context.Context) error {
-			return message.Abandon(ctx)
-		}, fail)
-		return
+	// Match broker settlement receipts by replaying this exact fenced request;
+	// the shared confirmation budget also bounds cleanup during shutdown.
+	stopSettlingRenew := func() {}
+	if r.cfg.autoRenew {
+		renewCtx, cancel := context.WithCancel(settleCtx)
+		var settlingWG sync.WaitGroup
+		settlingWG.Add(1)
+		go func() {
+			defer settlingWG.Done()
+			r.renewLoop(renewCtx, message, cancelHandler, fail, &progress, true, nil)
+		}()
+		var once sync.Once
+		stopSettlingRenew = func() { once.Do(func() { cancel(); settlingWG.Wait() }) }
 	}
-	r.settleWithRetry(settleCtx, func(ctx context.Context) error {
-		return message.Complete(ctx)
-	}, fail)
+	// Run cancellation still cancels a running handler. Once it returned, its
+	// heartbeat shares only the existing settlement confirmation budget.
+	defer stopSettlingRenew()
+	var err error
+	if handlerErr != nil {
+		err = r.retrySettlement(settleCtx, func(ctx context.Context) error {
+			return message.Abandon(ctx)
+		})
+	} else {
+		err = r.retrySettlement(settleCtx, func(ctx context.Context) error {
+			return message.Complete(ctx)
+		})
+	}
+	stopSettlingRenew()
+	r.settleError(err, fail)
 }
 
 func (r *Receiver) settleWithRetry(ctx context.Context, settle func(context.Context) error, fail func(error)) {
+	r.settleError(r.retrySettlement(ctx, settle), fail)
+}
+
+// settlementConfirmationError preserves the last transport or HTTP cause while
+// marking an exhausted confirmation budget as an unconfirmed settlement outcome.
+type settlementConfirmationError struct{ cause error }
+
+func (e *settlementConfirmationError) Error() string {
+	return fmt.Sprintf("mqlite: settlement outcome unknown after confirmation budget expired: %v", e.cause)
+}
+func (e *settlementConfirmationError) Unwrap() error        { return e.cause }
+func (e *settlementConfirmationError) Is(target error) bool { return target == ErrOutcomeUnknown }
+
+func (r *Receiver) retrySettlement(ctx context.Context, settle func(context.Context) error) error {
 	failures := 0
 	var lastErr error
 	for {
-		err := settle(ctx)
-		if err == nil {
-			return
+		if ctx.Err() != nil {
+			if lastErr == nil {
+				return ctx.Err() // no request was attempted
+			}
+			return &settlementConfirmationError{cause: lastErr}
 		}
-		lastErr = err
-		if !retryableOperationError(err) || ctx.Err() != nil {
-			r.settleError(err, fail)
-			return
+		callCtx, cancel := r.settlement.withTimeout(ctx, r.settlement.attemptTimeout)
+		lastErr = settle(callCtx)
+		cancel()
+		// Confirmed acknowledgements and definitive errors win a deadline race.
+		if lastErr == nil || !retryableOperationError(lastErr) {
+			return lastErr
+		}
+		if ctx.Err() != nil {
+			return &settlementConfirmationError{cause: lastErr}
 		}
 		delay := r.jitter(exponentialBackoff(r.settleBackoff, r.maxSettleBackoff, failures))
 		failures++
-		if !waitContext(ctx, delay) {
-			r.settleError(lastErr, fail)
-			return
+		if !r.settlement.wait(ctx, delay) {
+			return &settlementConfirmationError{cause: lastErr}
 		}
 	}
 }
@@ -822,12 +1112,14 @@ func (r *Receiver) renewMessage(ctx context.Context, message *Message, leaseLeng
 	if leaseLength <= 0 {
 		current.deadline = time.Time{}
 		current.deadlineUntrusted = true
+		current.legacyLeaseEstimate = 0
 		return current, nil
 	}
 	// Legacy single Renew does not return a deadline. The broker extends by the
 	// queue lock duration; the delivery's initial remaining lease is the safest
 	// estimate available without a management-permission metadata call.
 	current.deadline = started.Add(leaseLength)
+	current.legacyLeaseEstimate = leaseLength
 	return current, nil
 }
 
@@ -841,7 +1133,27 @@ func (r *Receiver) loseLease(cancelHandler context.CancelFunc, cause error) erro
 	return err
 }
 
-func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandler context.CancelFunc, fail func(error), deadline time.Time, leaseLength time.Duration, lease renewalLease) error {
+// renewalProgress is owned by one heartbeat at a time and transferred only
+// after joining it. Public Message metadata remains immutable during renewal.
+type renewalProgress struct {
+	deadline    time.Time
+	leaseLength time.Duration
+	lease       renewalLease
+}
+
+func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandler context.CancelFunc, fail func(error), progress *renewalProgress, settling bool, stop <-chan struct{}) error {
+	deadline, leaseLength, lease := progress.deadline, progress.leaseLength, progress.lease
+	defer func() { *progress = renewalProgress{deadline: deadline, leaseLength: leaseLength, lease: lease} }()
+	lose := func(cause error) error {
+		if settling {
+			// An already committed settlement makes Renew lose its token before
+			// the acknowledgement or exact receipt replay arrives. The final
+			// settlement alone resolves this: never replace Unknown with loss,
+			// or emit a second loss after an unsuccessful settlement.
+			return nil
+		}
+		return r.loseLease(cancelHandler, cause)
+	}
 	failures := 0
 
 	for {
@@ -852,14 +1164,14 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			} else {
 				remaining := time.Until(deadline)
 				if pathologicalExactLease(lease, remaining) {
-					return r.loseLease(cancelHandler, fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
+					return lose(fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
 				}
 				delay = autoRenewInterval(remaining, lease.responseRTT)
 			}
 		} else {
 			remaining := time.Until(deadline) - leaseDeadlineSafety
 			if !deadline.IsZero() && remaining <= 2*minimumRenewRetryHeadroom {
-				return r.loseLease(cancelHandler, ErrLockLost)
+				return lose(ErrLockLost)
 			}
 			delay = r.jitter(exponentialBackoff(r.renewRetryBackoff, r.maxRenewBackoff, failures-1))
 			if !deadline.IsZero() {
@@ -872,7 +1184,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 				}
 			}
 		}
-		if !waitContext(ctx, delay) {
+		if !waitRenewal(ctx, stop, delay) {
 			return nil
 		}
 
@@ -886,7 +1198,7 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 		if attemptErr != nil {
 			// The attempt consumed every locally defensible millisecond. Even a
 			// late transport result cannot restore a safe settlement window.
-			return r.loseLease(cancelHandler, attemptErr)
+			return lose(attemptErr)
 		}
 		if err == nil {
 			failures = 0
@@ -897,11 +1209,14 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 			}
 			confirmedDeadline, remaining := anchorLeaseDeadline(lease.deadline)
 			if pathologicalExactLease(lease, remaining) {
-				return r.loseLease(cancelHandler, fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
+				return lose(fmt.Errorf("%w: renewed lease is too short for the minimum renewal interval", ErrLockLost))
 			}
 			if remaining > leaseDeadlineSafety {
 				deadline = confirmedDeadline
 				leaseLength = remaining
+				if lease.legacyLeaseEstimate > 0 {
+					leaseLength = lease.legacyLeaseEstimate
+				}
 				if leaseNeedsUntrustedSchedule(lease, remaining) {
 					deadline = time.Time{}
 					leaseLength = 0
@@ -917,13 +1232,18 @@ func (r *Receiver) renewLoop(ctx context.Context, message *Message, cancelHandle
 				r.stopPermanentRenewal(cancelHandler, err, fail)
 				return err
 			}
-			return r.loseLease(cancelHandler, err)
+			if errors.Is(err, ErrLockLost) {
+				return lose(err) // Its own settlement may already have released the token.
+			}
+			cancelHandler()
+			r.notify(err)
+			return err
 		}
 		if deadline.IsZero() {
 			// The last acknowledgement proved ownership, but an unusable remote
 			// deadline gives no local retry budget. Cancel rather than allowing a
 			// second handler to overlap after an unbounded transient outage.
-			return r.loseLease(cancelHandler, err)
+			return lose(err)
 		}
 		failures++
 	}

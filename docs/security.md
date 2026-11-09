@@ -1,5 +1,10 @@
 # Security model
 
+This document follows unreleased `main`. For the latest released SDK, use the
+[v0.1.1 security model](https://github.com/mqlitehq/mqlite-go/blob/v0.1.1/docs/security.md).
+Client-side renewal, retry, transport ownership, and response checks described
+here do not upgrade the guarantees of an older broker.
+
 ## Credentials and transport
 
 Bearer tokens authorize the whole broker, not an individual queue. Use separate
@@ -22,10 +27,13 @@ roots, proxies, or transport controls. Do not set a short global timeout on that
 client: Receive uses request contexts for long polling. Set deadlines on each
 operation's context instead. Size a custom transport's idle pool to at least the
 managed receiver concurrency plus its effective prefetch; settlement can overlap
-the next claim wave. The SDK default owns a cloned transport with 64 idle
-connections per host. `Client.Close` closes only that SDK-owned pool, never a
-caller-supplied transport. The SDK shallow-clones a supplied `http.Client` to
-enforce no-redirect RPC behavior without mutating the caller's client.
+the next claim wave. When `http.DefaultTransport` is a standard
+`*http.Transport`, the SDK owns a clone with 64 idle connections per host. If the
+application has replaced that global with a wrapper, the SDK preserves the
+wrapper and leaves pool sizing and lifecycle to the application, just as for a
+caller-supplied transport. `Client.Close` closes only the SDK-owned pool. The SDK
+shallow-clones a supplied `http.Client` to enforce no-redirect RPC behavior
+without mutating the caller's client.
 
 A custom `RoundTripper` must not retry queue or subscription deletion: doing so
 would bypass the SDK's at-most-once deletion guard and could act on a later
@@ -90,13 +98,19 @@ Receive, including an empty result, ends that retry round and the next Receive
 uses a fresh attempt ID.
 Every replayed Peek-Lock batch is fenced by one broker renewal before handler
 dispatch, even when continuing auto-renew is disabled. Complete and Abandon then
-replay the exact same fenced request within a five-second bound; matching broker
+replay the exact same fenced request within a fresh 30-second confirmation budget,
+including retry waits, with at most fifteen seconds per attempt; matching broker
 settlement receipts make a lost-response replay idempotent. A handler slot is
 released when the handler returns, while a separate total-in-flight slot remains
 held through renewal shutdown and terminal settlement. The latter is capped at
 concurrency plus effective prefetch (at most twice concurrency), so settlement
 latency can overlap one claim wave without building an unbounded local lock
 queue.
+The confirmation budget is independent of `Run` cancellation, and shutdown joins
+it after a handler returns and renewal stops. These contexts are cooperative:
+custom transports and handlers must honor cancellation. Exhausted transient
+confirmation failures report `ErrOutcomeUnknown` while preserving the last
+transport or HTTP cause; definitive lock-loss or permanent errors remain unchanged.
 
 Queue and subscription deletion are name-addressed destructive operations. The
 SDK disables redirect following for every RPC and never transparently retries
@@ -116,6 +130,20 @@ AtMostOnce Receive surface an invalid success acknowledgement as
 Peek-Lock Receive can instead replay the
 same attempt ID. Only the managed receiver automatically retries identical
 fenced renewal, Complete, or Abandon requests.
+
+Receive validates the whole delivery list before exposing any handles: sequences
+must be positive and unique within that response. Peek-Lock and deferred
+deliveries also require nonempty fencing tokens before handler dispatch. Managed
+normal Receive retries a malformed batch with the same receive attempt ID;
+ReceiveDeferred is a separate operation without that replay key.
+ReceiveAndDelete intentionally grants no token, and read-only Peek does not
+require one. Token values have no client-enforced format or global uniqueness
+requirement.
+
+Receive responses require a positive sequence number for every item. A null item
+invalidates the entire batch before any message is exposed. Empty bodies and
+empty message lists remain valid. Send/Schedule acknowledgements reject null or negative
+sequence numbers but retain zero for topic no-match or skipped batch dedup slots.
 
 `force` is explicit permission to discard retained messages. It changes the
 empty-resource precondition, not the authorization level. A subscription TTL is

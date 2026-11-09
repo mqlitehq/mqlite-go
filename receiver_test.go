@@ -71,6 +71,36 @@ type deadlineLeaseSource struct {
 	renewalLeaseFn func(context.Context, *Message) (renewalLease, error)
 }
 
+// confirmedSubsecondClient observes acceptance at the next renewal boundary:
+// entry after two successful RPCs proves the Receiver consumed both lease ACKs.
+// The observer does not send a third HTTP request or change a returned lease.
+type confirmedSubsecondClient struct {
+	*Client
+	confirmed   int32
+	twoAccepted chan struct{}
+	once        sync.Once
+	single      bool
+	faultHits   int32
+}
+
+func (s *confirmedSubsecondClient) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
+	if atomic.LoadInt32(&s.confirmed) >= 2 {
+		s.once.Do(func() { close(s.twoAccepted) })
+		<-ctx.Done()
+		return renewalLease{}, ctx.Err()
+	}
+	if s.single && atomic.LoadInt32(&s.confirmed) >= 1 {
+		atomic.AddInt32(&s.faultHits, 1)
+		<-ctx.Done()
+		return renewalLease{}, ctx.Err()
+	}
+	lease, err := s.Client.renewLease(ctx, message)
+	if err == nil && ctx.Err() == nil && lease.deadline.After(time.Now().Add(leaseDeadlineSafety)) {
+		atomic.AddInt32(&s.confirmed, 1)
+	}
+	return lease, err
+}
+
 func (s *deadlineLeaseSource) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
 	if s.renewalLeaseFn != nil {
 		return s.renewalLeaseFn(ctx, message)
@@ -135,9 +165,12 @@ func (s *blockingRenewSettler) deferMsg(context.Context, string, int64, string) 
 
 func (s *blockingRenewSettler) renew(ctx context.Context, _ string, _ int64, _ string) error {
 	close(s.renewStarted)
-	<-ctx.Done()
-	close(s.renewCanceled)
-	<-s.allowRenewReturn
+	select {
+	case <-ctx.Done():
+		close(s.renewCanceled)
+		<-s.allowRenewReturn
+	case <-s.allowRenewReturn:
+	}
 	s.record("renew returned")
 	return ctx.Err()
 }
@@ -2168,54 +2201,139 @@ func TestReceiverUntrustedLeaseRenewalDoesNotSpin(t *testing.T) {
 }
 
 func TestReceiverSubsecondTrustedLeaseRenewsBeforeDeadline(t *testing.T) {
-	var renewCalls int32
-	var receiveCalls int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		now := time.Now()
-		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
-		switch req.URL.Path {
-		case wire.PathReceive:
-			if atomic.AddInt32(&receiveCalls, 1) > 1 {
-				<-req.Context().Done()
+	for _, mode := range []string{"healthy", "single_renewal_negative_control", "expired_response_negative_control"} {
+		t.Run(mode, func(t *testing.T) {
+			var renewCalls, receiveCalls, lateRenewals, expiredFaults, successfulCompletes int32
+			var mu sync.Mutex
+			var lockedUntil time.Time
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				now := time.Now()
+				w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+				switch req.URL.Path {
+				case wire.PathReceive:
+					if atomic.AddInt32(&receiveCalls, 1) > 1 {
+						<-req.Context().Done()
+						return
+					}
+					mu.Lock()
+					lockedUntil = now.Add(120 * time.Millisecond)
+					deadline := lockedUntil
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{SeqNumber: 55, LockToken: "lock-55", LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)}}})
+				case wire.PathRenewBatch:
+					atomic.AddInt32(&renewCalls, 1)
+					mu.Lock()
+					if !now.Before(lockedUntil) {
+						atomic.AddInt32(&lateRenewals, 1)
+						mu.Unlock()
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired"}`))
+						return
+					}
+					if mode == "expired_response_negative_control" {
+						remaining := time.Until(lockedUntil)
+						mu.Unlock()
+						atomic.AddInt32(&expiredFaults, 1)
+						// This response crosses the real lease horizon and must not
+						// satisfy the confirmation oracle. Keep fixture cleanup bounded
+						// even if a disconnected POST's context is not observed yet.
+						timer := time.NewTimer(remaining + 20*time.Millisecond)
+						defer timer.Stop()
+						select {
+						case <-req.Context().Done():
+						case <-timer.C:
+							w.WriteHeader(http.StatusConflict)
+							_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired"}`))
+						}
+						return
+					}
+					lockedUntil = now.Add(120 * time.Millisecond)
+					deadline := lockedUntil
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{SeqNumber: 55, Ok: true, LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)}}})
+				case wire.PathComplete:
+					mu.Lock()
+					valid := now.Before(lockedUntil)
+					mu.Unlock()
+					if !valid {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired before Complete"}`))
+						return
+					}
+					if err := json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true}); err == nil {
+						atomic.AddInt32(&successfulCompletes, 1)
+					}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			source := &confirmedSubsecondClient{Client: client, twoAccepted: make(chan struct{}), single: mode == "single_renewal_negative_control"}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			var observed int32
+			receiver := newReceiver(source, "jobs", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+				atomic.AddInt32(&observed, 1)
+				if mode == "healthy" {
+					t.Errorf("short trusted lease renewal: %v", err)
+				}
+			})})
+			accepted := false
+			err = receiver.Run(ctx, func(handlerCtx context.Context, _ *Message) error {
+				watchdog := time.NewTimer(2 * time.Second)
+				defer watchdog.Stop()
+				select {
+				case <-source.twoAccepted:
+					accepted = true
+				case <-handlerCtx.Done():
+				case <-watchdog.C:
+					t.Error("independent confirmation watchdog expired")
+				}
+				cancel()
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error=%v,want context.Canceled", err)
+			}
+			if mode != "healthy" {
+				if atomic.LoadInt32(&successfulCompletes) != 0 {
+					t.Fatal("negative control completed an unconfirmed delivery")
+				}
+				if accepted || atomic.LoadInt32(&source.confirmed) >= 2 {
+					t.Fatal("negative control satisfied the confirmed-renewal oracle")
+				}
+				if atomic.LoadInt32(&observed) == 0 {
+					t.Fatal("unsafe renewal failed without a lease-loss diagnostic")
+				}
+				if mode == "single_renewal_negative_control" && atomic.LoadInt32(&source.faultHits) != 1 {
+					t.Fatal("one-shot renewal fault was not exercised")
+				}
+				if mode == "expired_response_negative_control" && atomic.LoadInt32(&expiredFaults) != 1 {
+					t.Fatal("expired-response fault was not exercised")
+				}
 				return
 			}
-			_ = json.NewEncoder(w).Encode(wire.ReceiveResponse{Messages: []wire.Message{{
-				SeqNumber: 55, LockToken: "lock-55",
-				LockedUntilMs: now.Add(120*time.Millisecond).UnixNano() / int64(time.Millisecond),
-			}}})
-		case wire.PathRenewBatch:
-			atomic.AddInt32(&renewCalls, 1)
-			_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: []wire.SettleItemResult{{
-				SeqNumber: 55, Ok: true,
-				LockedUntilMs: now.Add(120*time.Millisecond).UnixNano() / int64(time.Millisecond),
-			}}})
-		case wire.PathComplete:
-			_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	client, err := Open(context.Background(), server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	receiver := client.Receiver("jobs", WithAutoRenew(), WithErrorHandler(func(err error) {
-		t.Errorf("short trusted lease renewal: %v", err)
-	}))
-	err = receiver.Run(ctx, func(context.Context, *Message) error {
-		time.Sleep(120 * time.Millisecond)
-		cancel()
-		return nil
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run error = %v, want context.Canceled", err)
-	}
-	if got := atomic.LoadInt32(&renewCalls); got < 2 || got > 20 {
-		t.Fatalf("renew calls = %d, want repeated bounded renewal for a real 40ms lease", got)
+			if atomic.LoadInt32(&successfulCompletes) != 1 {
+				t.Fatal("healthy delivery did not complete exactly once within its lease")
+			}
+			if !accepted || atomic.LoadInt32(&source.confirmed) != 2 {
+				t.Fatal("Receiver did not accept two successful lease confirmations")
+			}
+			if got := atomic.LoadInt32(&renewCalls); got != 2 {
+				t.Fatalf("renew calls=%d,want two confirmed bounded renewals for a real 120ms lease", got)
+			}
+			if atomic.LoadInt32(&lateRenewals) != 0 {
+				t.Fatal("renewal arrived outside the previously confirmed lease horizon")
+			}
+			if atomic.LoadInt32(&observed) != 0 {
+				t.Fatal("healthy subsecond lease reported an error")
+			}
+		})
 	}
 }
 
@@ -3309,6 +3427,81 @@ func TestRenewRetryClassification(t *testing.T) {
 	}
 }
 
+// Definitive renewal errors keep their broker category; a failed confirmation
+// is not proof that the broker rejected the token. Settlement still arbitrates
+// actual ownership loss so a committed outcome is not reported twice.
+func TestReceiverPreservesDefinitiveRenewalErrors(t *testing.T) {
+	for _, phase := range []string{"initial", "handling", "settling"} {
+		for _, status := range []int{400, 401, 403, 409} {
+			t.Run(fmt.Sprintf("%s/%d", phase, status), func(t *testing.T) {
+				cause := ErrInvalidArgument
+				if status == 401 {
+					cause = ErrUnauthenticated
+				}
+				if status == 403 {
+					cause = ErrPermissionDenied
+				}
+				if status == 409 {
+					cause = ErrLockLost
+				}
+				want := &HTTPError{StatusCode: status, cause: cause}
+				f := &fakeReceiveSource{renewFn: func(int) error { return want }}
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				var observed []error
+				fatal := 0
+				r := newReceiver(f, "jobs", []ReceiverOption{WithErrorHandler(func(err error) { observed = append(observed, err) })})
+				fail := func(error) { fatal++ }
+				m := f.message(1)
+				if phase == "initial" {
+					r.processWithHandlerRelease(ctx, m, func(context.Context, *Message) error {
+						t.Error("initial renewal failure dispatched handler")
+						return nil
+					}, func() {}, fail, true)
+				} else {
+					deadline := time.Now().Add(time.Second)
+					progress := renewalProgress{deadline: deadline, leaseLength: time.Second, lease: renewalLease{deadline: deadline, responseRTT: time.Second}}
+					canceled := 0
+					got := r.renewLoop(ctx, m, func() { canceled++ }, fail, &progress, phase == "settling", nil)
+					if phase == "settling" && status == 409 {
+						if got != nil || canceled != 0 || len(observed) != 0 {
+							t.Fatalf("settlement heartbeat changed final-outcome arbitration: result=%v canceled=%d observed=%v", got, canceled, observed)
+						}
+					} else if !errors.Is(got, want) || canceled != 1 {
+						t.Fatalf("result=%v canceled=%d, want original error and one handler cancellation", got, canceled)
+					}
+				}
+				silent := phase == "settling" && status == 409
+				if !silent {
+					if len(observed) != 1 || !errors.Is(observed[0], want) || !errors.Is(observed[0], cause) {
+						t.Fatalf("observed=%v, want original HTTP %d and cause", observed, status)
+					}
+					var he *HTTPError
+					if !errors.As(observed[0], &he) || he.StatusCode != status {
+						t.Fatalf("HTTP status was lost: %v", observed)
+					}
+					if status == 400 && errors.Is(observed[0], ErrLockLost) {
+						t.Fatal("invalid_argument must not be rewritten as lock_lost")
+					}
+				}
+				wantFatal := 0
+				if status == 401 || status == 403 {
+					wantFatal = 1
+				}
+				if fatal != wantFatal {
+					t.Fatalf("fatal=%d, want %d", fatal, wantFatal)
+				}
+				f.mu.Lock()
+				calls := f.renewCalls
+				f.mu.Unlock()
+				if calls != 1 {
+					t.Fatalf("renew calls=%d, want no replay", calls)
+				}
+			})
+		}
+	}
+}
+
 func TestSettlementExhaustionPreservesHTTPStatusClassification(t *testing.T) {
 	receiver := newReceiver(nil, "jobs", nil)
 	tests := []struct {
@@ -3990,16 +4183,18 @@ func TestReceiverJoinsInFlightRenewBeforeComplete(t *testing.T) {
 	}()
 
 	select {
-	case <-settler.renewCanceled:
+	case <-settler.renewStarted:
 	case <-time.After(time.Second):
 		close(settler.allowRenewReturn)
-		t.Fatal("in-flight renewal did not observe cancellation")
+		t.Fatal("in-flight renewal did not start")
 	}
 
 	settledEarly := false
 	select {
 	case <-settler.completeCalled:
 		settledEarly = true
+	case <-settler.renewCanceled:
+		t.Error("normal handoff canceled a healthy renewal")
 	case <-time.After(20 * time.Millisecond):
 	}
 	close(settler.allowRenewReturn)
@@ -4055,5 +4250,1473 @@ func TestReceiverRejectsOversizedReceiveBatch(t *testing.T) {
 	err := receiver.Run(context.Background(), func(context.Context, *Message) error { return nil })
 	if err == nil || len(source.settleSnapshot()) != 0 {
 		t.Fatalf("Run error = %v, settlements = %+v", err, source.settleSnapshot())
+	}
+}
+
+// settlementClock advances context deadlines and retry waits without depending
+// on scheduler timing or sleeping through multi-second remote confirmations.
+type settlementClock struct {
+	mu       sync.Mutex
+	now      time.Time
+	contexts []*settlementTestContext
+	timeouts []time.Duration
+}
+type settlementTestContext struct {
+	clock    *settlementClock
+	parent   context.Context
+	deadline time.Time
+	done     chan struct{}
+	err      error
+}
+
+func (c *settlementTestContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *settlementTestContext) Done() <-chan struct{}       { return c.done }
+func (c *settlementTestContext) Err() error {
+	c.clock.mu.Lock()
+	err := c.err
+	c.clock.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return c.parent.Err()
+}
+func (c *settlementTestContext) Value(key interface{}) interface{} { return c.parent.Value(key) }
+func (c *settlementClock) withTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	c.mu.Lock()
+	deadline := c.now.Add(d)
+	if limit, ok := parent.Deadline(); ok && limit.Before(deadline) {
+		deadline = limit
+	}
+	ctx := &settlementTestContext{clock: c, parent: parent, deadline: deadline, done: make(chan struct{})}
+	c.contexts = append(c.contexts, ctx)
+	c.timeouts = append(c.timeouts, d)
+	c.mu.Unlock()
+	return ctx, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if ctx.err == nil {
+			ctx.err = context.Canceled
+			close(ctx.done)
+		}
+	}
+}
+func (c *settlementClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+	for _, ctx := range c.contexts {
+		if ctx.err == nil && !ctx.deadline.After(c.now) {
+			ctx.err = context.DeadlineExceeded
+			close(ctx.done)
+		}
+	}
+}
+func (c *settlementClock) time() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *settlementClock) wait(ctx context.Context, d time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := deadline.Sub(c.time()); remaining < d {
+			d = remaining
+		}
+	}
+	c.advance(d)
+	return ctx.Err() == nil
+}
+func useSettlementClock(r *Receiver) *settlementClock {
+	c := &settlementClock{now: time.Now()}
+	r.settlement.withTimeout = c.withTimeout
+	r.settlement.wait = c.wait
+	return c
+}
+
+type settlementIdentitySource struct {
+	*fakeReceiveSource
+	settle     func(context.Context) error
+	identities []settleRecord
+}
+
+func (s *settlementIdentitySource) complete(ctx context.Context, queue string, seq int64, token string) error {
+	s.identities = append(s.identities, settleRecord{op: "complete", queue: queue, seq: seq, token: token})
+	return s.settle(ctx)
+}
+func (s *settlementIdentitySource) abandon(ctx context.Context, queue string, seq int64, token string, delay int64) error {
+	s.identities = append(s.identities, settleRecord{op: "abandon", queue: queue, seq: seq, token: token, delay: delay})
+	return s.settle(ctx)
+}
+
+func settlementBudgetSource() *settlementIdentitySource {
+	base := &fakeReceiveSource{}
+	source := &settlementIdentitySource{fakeReceiveSource: base}
+	base.receiveFn = func(ctx context.Context, call int, _ receiveRecord) ([]*Message, error) {
+		if call == 1 {
+			message := base.message(42)
+			message.s = source
+			return []*Message{message}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return source
+}
+
+func TestReceiverSettlementSlowConfirmationBudget(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			source := settlementBudgetSource()
+			observed, handlers, attempts, effects := 0, 0, 0, 0
+			r := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) { observed++; cancel() })})
+			clock := useSettlementClock(r)
+			source.settle = func(callCtx context.Context) error {
+				attempts++
+				clock.advance(3 * time.Second)
+				if err := callCtx.Err(); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					effects++
+					return io.EOF
+				}
+				cancel()
+				return nil
+			}
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				if operation == "abandon" {
+					return errors.New("handler failure")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || observed != 0 || handlers != 1 || attempts != 2 || effects != 1 {
+				t.Fatalf("Run=%v observed=%d handlers=%d attempts=%d effects=%d", err, observed, handlers, attempts, effects)
+			}
+			if len(source.identities) != 2 || source.identities[0] != source.identities[1] || source.identities[0].op != operation {
+				t.Fatalf("settlement identity changed: %+v", source.identities)
+			}
+			if len(clock.timeouts) != 3 || clock.timeouts[0] != 30*time.Second || clock.timeouts[1] != 15*time.Second || clock.timeouts[2] != 15*time.Second {
+				t.Fatalf("total/attempt budgets=%v, want 30s/15s/15s", clock.timeouts)
+			}
+			for _, ctx := range clock.contexts {
+				if ctx.Err() == nil {
+					t.Error("confirmation context timer was not released")
+				}
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementEightSecondConfirmationReplay(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			source := settlementBudgetSource()
+			observed, handlers, attempts, effects := 0, 0, 0, 0
+			r := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) { observed++; cancel() })})
+			r.jitter = func(d time.Duration) time.Duration { return d }
+			clock := useSettlementClock(r)
+			start := clock.time()
+			source.settle = func(callCtx context.Context) error {
+				attempts++
+				elapsed := 8 * time.Second
+				if effects == 0 {
+					clock.advance(time.Second)
+					effects++ // the first request commits before its response is lost
+					elapsed -= time.Second
+				}
+				if deadline, ok := callCtx.Deadline(); ok && deadline.Sub(clock.time()) < elapsed {
+					clock.advance(deadline.Sub(clock.time()))
+					return callCtx.Err()
+				}
+				clock.advance(elapsed)
+				if err := callCtx.Err(); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					return io.EOF
+				}
+				cancel()
+				return nil // exact replay confirms the existing receipt
+			}
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				if operation == "abandon" {
+					return errors.New("handler failure")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || observed != 0 || handlers != 1 || attempts != 2 || effects != 1 {
+				t.Fatalf("Run=%v observed=%d handlers=%d attempts=%d effects=%d virtual_elapsed=%s", err, observed, handlers, attempts, effects, clock.time().Sub(start))
+			}
+			if len(source.identities) != 2 || source.identities[0] != source.identities[1] || source.identities[0].op != operation {
+				t.Fatalf("settlement identity changed: %+v", source.identities)
+			}
+			if elapsed := clock.time().Sub(start); elapsed != 16*time.Second+r.settleBackoff {
+				t.Fatalf("virtual elapsed=%s, want two 8-second requests and one retry wait", elapsed)
+			}
+			for _, callCtx := range clock.contexts {
+				if callCtx.Err() == nil {
+					t.Error("confirmation context timer was not released")
+				}
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementCancellationJoinsConfirmation(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			source := settlementBudgetSource()
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+			observed, handlers, attempts := 0, 0, 0
+			r := newReceiver(source, "jobs", []ReceiverOption{WithErrorHandler(func(error) { observed++ })})
+			clock := useSettlementClock(r)
+			source.settle = func(callCtx context.Context) error {
+				attempts++
+				if attempts == 1 {
+					if callCtx.Err() != nil {
+						t.Error("Run cancellation canceled fresh cleanup context")
+					}
+					close(entered)
+					<-release
+				}
+				clock.advance(8 * time.Second)
+				if err := callCtx.Err(); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					return io.EOF
+				}
+				return nil
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- r.Run(ctx, func(context.Context, *Message) error {
+					handlers++
+					cancel()
+					if operation == "abandon" {
+						return context.Canceled
+					}
+					return nil
+				})
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("cleanup did not start")
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("Run returned before cleanup was released: %v", err)
+			default:
+			}
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not join cleanup")
+			}
+			if observed != 0 || handlers != 1 || attempts != 2 || len(source.identities) != 2 || source.identities[0] != source.identities[1] {
+				t.Fatalf("observed=%d handlers=%d attempts=%d identities=%+v", observed, handlers, attempts, source.identities)
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementBudgetDoesNotInventUncertainty(t *testing.T) {
+	r := newReceiver(nil, "q", nil)
+	clock := useSettlementClock(r)
+	ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancel()
+	err := r.retrySettlement(ctx, func(context.Context) error { clock.advance(30 * time.Second); return nil })
+	if err != nil {
+		t.Fatalf("confirmed acknowledgement replaced by deadline: %v", err)
+	}
+	ctx, cancel = clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancel()
+	clock.advance(30 * time.Second)
+	calls := 0
+	err = r.retrySettlement(ctx, func(context.Context) error { calls++; return nil })
+	if calls != 0 || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("pre-expired budget calls=%d err=%v", calls, err)
+	}
+}
+
+func TestReceiverSettlementExhaustionPreservesLastCause(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{"fast EOF", io.EOF}, {"HTTP 503 body is not permanent", &HTTPError{StatusCode: 503, cause: ErrPermissionDenied}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReceiver(nil, "q", nil)
+			clock := useSettlementClock(r)
+			start := clock.time()
+			ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+			defer cancel()
+			attempts := 0
+			err := r.retrySettlement(ctx, func(context.Context) error { attempts++; return tc.cause })
+			if !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, tc.cause) {
+				t.Fatalf("exhausted error=%v, want outcome unknown and original cause", err)
+			}
+			if attempts < 2 || clock.time().Sub(start) < 30*time.Second || clock.time().Sub(start) > 31*time.Second {
+				t.Fatalf("attempts=%d elapsed=%s", attempts, clock.time().Sub(start))
+			}
+			if tc.name != "fast EOF" {
+				var status *HTTPError
+				if !errors.As(err, &status) || status.StatusCode != 503 {
+					t.Fatal("HTTP error type lost")
+				}
+				fatal := false
+				r.settleError(err, func(error) { fatal = true })
+				if fatal {
+					t.Fatal("transient status became permanent after wrapping")
+				}
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementAttemptTimeoutAndPermanentBoundary(t *testing.T) {
+	r := newReceiver(nil, "q", nil)
+	r.jitter = func(d time.Duration) time.Duration { return d }
+	clock := useSettlementClock(r)
+	start := clock.time()
+	ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancel()
+	attempts := 0
+	var attemptBudgets []time.Duration
+	err := r.retrySettlement(ctx, func(callCtx context.Context) error {
+		attempts++
+		deadline, _ := callCtx.Deadline()
+		remaining := deadline.Sub(clock.time())
+		if remaining <= 0 || remaining > 15*time.Second {
+			t.Fatalf("attempt remaining=%s", remaining)
+		}
+		attemptBudgets = append(attemptBudgets, remaining)
+		clock.advance(remaining)
+		return callCtx.Err()
+	})
+	if attempts != 2 || clock.time().Sub(start) != 30*time.Second || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("attempts=%d elapsed=%s err=%v", attempts, clock.time().Sub(start), err)
+	}
+	if attemptBudgets[0] != 15*time.Second || attemptBudgets[1] != 15*time.Second-r.settleBackoff {
+		t.Fatalf("blackhole attempt budgets=%v, want first 15s and total-budget-clipped replay", attemptBudgets)
+	}
+	for _, terminal := range []error{ErrLockLost, ErrUnauthenticated, ErrInvalidArgument, &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}} {
+		r := newReceiver(nil, "q", nil)
+		clock := useSettlementClock(r)
+		ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+		got := r.retrySettlement(ctx, func(context.Context) error { clock.advance(30 * time.Second); return terminal })
+		cancel()
+		if got != terminal || errors.Is(got, ErrOutcomeUnknown) {
+			t.Fatalf("terminal error wrapped: %v", got)
+		}
+	}
+}
+
+// TestReceiverInitialConfirmationBatchFitsSharedLease models one remote writer
+// already occupied for 400ms followed by 350ms renewal statements. Four
+// separately confirmed deliveries cannot all fit their original 1.5s lease;
+// one set-based confirmation can, without relaxing an item's watchdog.
+func TestReceiverInitialConfirmationBatchFitsSharedLease(t *testing.T) {
+	const messages = 4
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var receiveCalls, renewalRequests, handlerCalls, completeCalls int
+	var batchSizes []int
+	var observed []error
+	deadlines := make(map[int64]time.Time)
+	handled := make(map[int64]int)
+	completed := make(map[int64]int)
+	writePermit := make(chan struct{}, 1)
+	writePermit <- struct{}{}
+	var occupied sync.Once
+	allComplete := make(chan struct{})
+	failed := make(chan error, 1)
+	serverStop := make(chan struct{})
+	writeJSON := func(w http.ResponseWriter, started time.Time, value interface{}) {
+		now := time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+		w.Header().Set(wire.ServerElapsedHeader, strconv.FormatInt(now.Sub(started).Nanoseconds()/int64(time.Millisecond), 10))
+		_ = json.NewEncoder(w).Encode(value)
+	}
+	wait := func(call context.Context, duration time.Duration) bool {
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return true
+		case <-call.Done():
+			return false
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		started := time.Now()
+		switch req.URL.Path {
+		case wire.PathReceive:
+			var receive wire.ReceiveRequest
+			if err := json.NewDecoder(req.Body).Decode(&receive); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			receiveCalls++
+			call := receiveCalls
+			mu.Unlock()
+			if call == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "unavailable", Message: "retry the same receive attempt"})
+				return
+			}
+			if call > 2 {
+				select {
+				case <-req.Context().Done():
+				case <-serverStop:
+				}
+				return
+			}
+			deadline := time.Now().Add(1500 * time.Millisecond)
+			response := wire.ReceiveResponse{}
+			mu.Lock()
+			for i := 1; i <= messages; i++ {
+				sequence := int64(i)
+				deadlines[sequence] = deadline
+				response.Messages = append(response.Messages, wire.Message{SeqNumber: sequence, LockToken: fmt.Sprintf("token-%d", i), DeliveryCount: 1, MessageID: fmt.Sprintf("message-%d", i), Body: []byte(fmt.Sprintf("payload-%d", i)), LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)})
+			}
+			mu.Unlock()
+			writeJSON(w, started, response)
+		case wire.PathRenewBatch:
+			var request wire.RenewBatchRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			renewalRequests++
+			batchSizes = append(batchSizes, len(request.Messages))
+			mu.Unlock()
+			select {
+			case <-writePermit:
+			case <-req.Context().Done():
+				return
+			}
+			defer func() { writePermit <- struct{}{} }()
+			ready := true
+			occupied.Do(func() { ready = wait(req.Context(), 400*time.Millisecond) })
+			if !ready || !wait(req.Context(), 350*time.Millisecond) {
+				return
+			}
+			response := wire.RenewBatchResponse{}
+			now := time.Now()
+			mu.Lock()
+			for _, item := range request.Messages {
+				result := wire.SettleItemResult{SeqNumber: item.SeqNumber}
+				if item.LockToken == fmt.Sprintf("token-%d", item.SeqNumber) && deadlines[item.SeqNumber].After(now) {
+					result.Ok = true
+					deadlines[item.SeqNumber] = now.Add(3 * time.Second)
+					result.LockedUntilMs = deadlines[item.SeqNumber].UnixNano() / int64(time.Millisecond)
+				}
+				response.Results = append(response.Results, result)
+			}
+			mu.Unlock()
+			writeJSON(w, started, response)
+		case wire.PathComplete:
+			var request wire.SettleRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			if request.LockToken != fmt.Sprintf("token-%d", request.SeqNumber) || !deadlines[request.SeqNumber].After(time.Now()) {
+				mu.Unlock()
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			completed[request.SeqNumber]++
+			completeCalls++
+			count := completeCalls
+			mu.Unlock()
+			writeJSON(w, started, wire.SettleResponse{Ok: true})
+			if count == messages {
+				close(allComplete)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	defer close(serverStop)
+	client, err := Open(ctx, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Receiver("q", WithConcurrency(messages), WithPrefetch(messages), WithAutoRenew(), WithErrorHandler(func(err error) {
+			mu.Lock()
+			observed = append(observed, err)
+			mu.Unlock()
+			select {
+			case failed <- err:
+			default:
+			}
+		})).Run(ctx, func(handlerCtx context.Context, message *Message) error {
+			mu.Lock()
+			handlerCalls++
+			handled[message.SequenceNumber]++
+			mu.Unlock()
+			if message.MessageID != fmt.Sprintf("message-%d", message.SequenceNumber) || string(message.Body) != fmt.Sprintf("payload-%d", message.SequenceNumber) || message.DeliveryCount != 1 {
+				return errors.New("delivery identity differs")
+			}
+			if !wait(handlerCtx, 20*time.Millisecond) {
+				return handlerCtx.Err()
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-allComplete:
+	case <-failed:
+	case <-ctx.Done():
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want caller cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not join")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(observed) != 0 || handlerCalls != messages || completeCalls != messages {
+		t.Fatalf("valid shared-budget batch failed: handlers=%d complete=%d errors=%v renewRequests=%d batchSizes=%v", handlerCalls, completeCalls, observed, renewalRequests, batchSizes)
+	}
+	for i := 1; i <= messages; i++ {
+		if handled[int64(i)] != 1 || completed[int64(i)] != 1 {
+			t.Fatalf("sequence %d handled/completed %d/%d", i, handled[int64(i)], completed[int64(i)])
+		}
+	}
+	if renewalRequests != 1 || len(batchSizes) != 1 || batchSizes[0] != messages {
+		t.Fatalf("initial confirmation requests=%d batchSizes=%v, want one batch of four", renewalRequests, batchSizes)
+	}
+}
+
+type initialBatchSource struct {
+	*deadlineLeaseSource
+	batchFn  func(context.Context, []*Message) ([]initialRenewalResult, error)
+	legacyFn func(context.Context, int64) error
+}
+
+func (s *initialBatchSource) renewInitialBatch(ctx context.Context, _ string, messages []*Message) ([]initialRenewalResult, error) {
+	return s.batchFn(ctx, messages)
+}
+
+func (s *initialBatchSource) renew(ctx context.Context, queue string, seq int64, token string) error {
+	if s.legacyFn != nil {
+		return s.legacyFn(ctx, seq)
+	}
+	return s.fakeReceiveSource.renew(ctx, queue, seq, token)
+}
+
+func initialBatchMessages(source *initialBatchSource, count int) []*Message {
+	messages := make([]*Message, count)
+	for i := range messages {
+		message := source.fakeReceiveSource.message(int64(i + 1))
+		message.s = source
+		message.LockedUntil = time.Now().Add(time.Second)
+		message.localLeaseDeadline = message.LockedUntil
+		message.leaseResponseRTT = time.Second
+		message.leaseClockResolution = time.Millisecond
+		messages[i] = message
+	}
+	return messages
+}
+
+func TestInitialConfirmationBatchValidatesEveryWireResult(t *testing.T) {
+	for _, name := range []string{"partial", "missing", "wrong sequence", "invalid deadline"} {
+		t.Run(name, func(t *testing.T) {
+			var calls int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				var body wire.RenewBatchRequest
+				if request.URL.Path != wire.PathRenewBatch || json.NewDecoder(request.Body).Decode(&body) != nil || len(body.Messages) != 2 {
+					t.Error("initial confirmation changed its single batch request")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				atomic.AddInt32(&calls, 1)
+				deadline := time.Now().Add(time.Second).UnixNano() / int64(time.Millisecond)
+				results := []wire.SettleItemResult{{SeqNumber: 1, Ok: true, LockedUntilMs: deadline}, {SeqNumber: 2}}
+				switch name {
+				case "missing":
+					results = results[:1]
+				case "wrong sequence":
+					results[1].SeqNumber = 1
+				case "invalid deadline":
+					results[0].LockedUntilMs = 0
+				}
+				w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
+				_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: results})
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages := []*Message{client.Message("q", 1, "one"), client.Message("q", 2, "two")}
+			results, err := client.renewInitialBatch(context.Background(), "q", messages)
+			if atomic.LoadInt32(&calls) != 1 {
+				t.Fatal("initial confirmation was not one request")
+			}
+			if name != "partial" {
+				if !errors.Is(err, ErrOutcomeUnknown) || results != nil {
+					t.Fatalf("malformed confirmation accepted: results=%v err=%v", results, err)
+				}
+				return
+			}
+			if err != nil || len(results) != 2 || results[0].err != nil || !results[0].lease.deadline.After(time.Now()) || !errors.Is(results[1].err, ErrLockLost) {
+				t.Fatalf("partial ownership was not fenced per item: results=%v err=%v", results, err)
+			}
+			if !messages[0].LockedUntil.IsZero() || !messages[1].LockedUntil.IsZero() {
+				t.Fatal("initial confirmation mutated the public message deadline")
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationBatchFailureStopsBeforeDispatch(t *testing.T) {
+	for _, status := range []int{401, 403, 503} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			var runCtx context.Context
+			var batchCalls, handlers, callbacks int32
+			base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+				if n == 1 {
+					runCtx = call
+					return messages, nil
+				}
+				<-call.Done()
+				return nil, call.Err()
+			}
+			responseErr := &HTTPError{StatusCode: status, cause: ErrPermissionDenied}
+			source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+				atomic.AddInt32(&batchCalls, 1)
+				return nil, responseErr
+			}
+			r := newReceiver(source, "q", []ReceiverOption{WithAutoRenew(), WithConcurrency(2), WithErrorHandler(func(error) {
+				atomic.AddInt32(&callbacks, 1)
+				if status != 503 && runCtx.Err() == nil {
+					t.Error("permanent batch error notified before stopping Run")
+				}
+				if status == 503 && runCtx.Err() != nil && ctx.Err() == nil {
+					t.Error("503 permission body became a permanent Run failure")
+				}
+				cancel()
+			})})
+			err := r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+			if atomic.LoadInt32(&handlers) != 0 || atomic.LoadInt32(&batchCalls) != 1 || atomic.LoadInt32(&callbacks) == 0 || len(base.settleSnapshot()) != 0 {
+				t.Fatal("failed batch reached a handler, settlement or another batch probe")
+			}
+			if status != 503 && (err != responseErr || len(base.receiveSnapshot()) != 1) {
+				t.Fatalf("permanent batch error did not fence Run: %v", err)
+			}
+			if status == 503 && !errors.Is(err, context.Canceled) {
+				t.Fatalf("503 no longer follows per-item fail-closed semantics: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationLegacyOrderReleasesBeforeHandlers(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 3)
+	now := time.Now()
+	messages[0].localLeaseDeadline = now.Add(900 * time.Millisecond)
+	messages[1].localLeaseDeadline = now.Add(500 * time.Millisecond)
+	messages[2].localLeaseDeadline = now.Add(700 * time.Millisecond)
+	var probes int32
+	source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+		atomic.AddInt32(&probes, 1)
+		return nil, ErrUnsupported
+	}
+	var mu sync.Mutex
+	var order []int64
+	allRenewed := make(chan struct{})
+	source.legacyFn = func(_ context.Context, seq int64) error {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, seq)
+		if len(order) == 3 {
+			close(allRenewed)
+		}
+		return nil
+	}
+	r := newReceiver(source, "q", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	plans, err := r.prepareInitialRenewals(ctx, messages, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseHandlers := make(chan struct{})
+	var workers sync.WaitGroup
+	for i, message := range messages {
+		workers.Add(1)
+		go func(message *Message, plan *initialRenewalPlan) {
+			defer workers.Done()
+			r.processWithHandlerRelease(ctx, message, func(context.Context, *Message) error { <-releaseHandlers; return nil }, func() {}, func(error) {}, true, plan)
+		}(message, plans[i])
+	}
+	select {
+	case <-allRenewed:
+	case <-ctx.Done():
+		close(releaseHandlers)
+		workers.Wait()
+		t.Fatal("a handler held the next initial confirmation")
+	}
+	close(releaseHandlers)
+	workers.Wait()
+	mu.Lock()
+	got := append([]int64(nil), order...)
+	mu.Unlock()
+	if len(got) != 3 || got[0] != 2 || got[1] != 3 || got[2] != 1 || len(base.settleSnapshot()) != 3 {
+		t.Fatalf("legacy confirmation order=%v", got)
+	}
+	_, err = r.prepareInitialRenewals(ctx, messages, true)
+	if err != nil || atomic.LoadInt32(&probes) != 1 {
+		t.Fatal("unsupported initial batch capability was not cached")
+	}
+}
+
+func TestInitialConfirmationUnsupportedProbeCannotResetWatchdog(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 2)
+	for _, message := range messages {
+		message.localLeaseDeadline = time.Now().Add(80 * time.Millisecond)
+	}
+	source.batchFn = func(ctx context.Context, _ []*Message) ([]initialRenewalResult, error) {
+		<-ctx.Done()
+		return nil, ErrUnsupported
+	}
+	var legacy, handlers, errorsSeen int32
+	source.legacyFn = func(context.Context, int64) error { atomic.AddInt32(&legacy, 1); return nil }
+	r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { atomic.AddInt32(&errorsSeen, 1) })})
+	plans, err := r.prepareInitialRenewals(context.Background(), messages, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.processWithHandlerRelease(context.Background(), messages[0], func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil }, func() {}, func(error) {}, true, plans[0])
+	if atomic.LoadInt32(&legacy) != 0 || atomic.LoadInt32(&handlers) != 0 || atomic.LoadInt32(&errorsSeen) != 1 {
+		t.Fatal("404 retry widened an exhausted original watchdog")
+	}
+}
+
+func TestInitialConfirmationLateAckAndPartialResults(t *testing.T) {
+	for _, kind := range []string{"partial", "malformed", "late acknowledgement", "expired acknowledgement", "goexit"} {
+		t.Run(kind, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			if kind == "late acknowledgement" {
+				for _, message := range messages {
+					message.localLeaseDeadline = time.Now().Add(80 * time.Millisecond)
+				}
+			}
+			source.batchFn = func(ctx context.Context, messages []*Message) ([]initialRenewalResult, error) {
+				if kind == "goexit" {
+					runtime.Goexit()
+				}
+				if kind == "late acknowledgement" {
+					<-ctx.Done()
+				}
+				deadline := time.Now().Add(time.Second)
+				if kind == "expired acknowledgement" {
+					deadline = time.Now().Add(-time.Millisecond)
+				}
+				results := make([]initialRenewalResult, len(messages))
+				for i := range results {
+					results[i].lease = renewalLease{deadline: deadline, clockResolution: time.Millisecond}
+				}
+				if kind == "partial" {
+					results[1].err = ErrLockLost
+				}
+				if kind == "malformed" {
+					results = results[:1]
+				}
+				return results, nil
+			}
+			var handlers, errorsSeen int32
+			r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { atomic.AddInt32(&errorsSeen, 1) })})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				plans, err := r.prepareInitialRenewals(context.Background(), messages, true)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				for i, message := range messages {
+					r.processWithHandlerRelease(context.Background(), message, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil }, func() {}, func(error) {}, true, plans[i])
+				}
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial batch invocation did not join")
+			}
+			wantHandlers := int32(0)
+			if kind == "partial" {
+				wantHandlers = 1
+			}
+			if atomic.LoadInt32(&handlers) != wantHandlers || len(base.settleSnapshot()) != int(wantHandlers) || atomic.LoadInt32(&errorsSeen) != 2-wantHandlers {
+				t.Fatalf("prepared acknowledgement escaped its fence: handlers=%d errors=%d", handlers, errorsSeen)
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationRunCancellationJoinsBatch(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+		if n == 1 {
+			return messages, nil
+		}
+		<-call.Done()
+		return nil, call.Err()
+	}
+	started, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	source.batchFn = func(call context.Context, _ []*Message) ([]initialRenewalResult, error) {
+		close(started)
+		<-call.Done()
+		close(canceled)
+		<-release
+		return []initialRenewalResult{{lease: renewalLease{deadline: time.Now().Add(time.Hour)}}, {lease: renewalLease{deadline: time.Now().Add(time.Hour)}}}, nil
+	}
+	var handlers, errorsSeen int32
+	r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithErrorHandler(func(error) { atomic.AddInt32(&errorsSeen, 1) })})
+	// A Receive replay forces the initial fence without requiring auto-renew.
+	first := true
+	originalReceive := base.receiveFn
+	base.receiveFn = func(call context.Context, n int, record receiveRecord) ([]*Message, error) {
+		if first {
+			first = false
+			return nil, &HTTPError{StatusCode: 503}
+		}
+		return originalReceive(call, n-1, record)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+	}()
+	<-started
+	cancel()
+	<-canceled
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("Run detached its canceled initial batch")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not join the initial batch")
+	}
+	if handlers != 0 || errorsSeen != 0 || len(base.settleSnapshot()) != 0 {
+		t.Fatal("late canceled batch acknowledgement dispatched work")
+	}
+}
+
+func TestInitialConfirmationOversizedGroupUsesOrderedFallback(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	var batchCalls int32
+	source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+		atomic.AddInt32(&batchCalls, 1)
+		return nil, ErrInvalidArgument
+	}
+	messages := initialBatchMessages(source, MaxRenewBatch+1)
+	r := newReceiver(source, "q", nil)
+	plans, err := r.prepareInitialRenewals(context.Background(), messages, true)
+	if err != nil || atomic.LoadInt32(&batchCalls) != 0 || len(plans) != len(messages) {
+		t.Fatal("large custom-source receive became a rejected renewal batch")
+	}
+	for i, plan := range plans {
+		if plan == nil || plan.result != nil || plan.done == nil || (i > 0 && plan.previous != plans[i-1].done) {
+			t.Fatal("large custom-source receive lost its ordered fallback")
+		}
+	}
+}
+
+func TestInitialConfirmationAbnormalLegacyExitReleasesNextItem(t *testing.T) {
+	for _, kind := range []string{"goexit", "panic"} {
+		t.Run(kind, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			source.legacyFn = func(_ context.Context, seq int64) error {
+				if seq == 1 {
+					if kind == "goexit" {
+						runtime.Goexit()
+					}
+					panic("synthetic initial confirmation panic")
+				}
+				return nil
+			}
+			r := newReceiver(source, "q", nil)
+			r.renewBatchUnsupported = true
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			plans, err := r.prepareInitialRenewals(ctx, messages, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var workers sync.WaitGroup
+			var handlers, panics int32
+			for i, message := range messages {
+				workers.Add(1)
+				go func(message *Message, plan *initialRenewalPlan) {
+					defer workers.Done()
+					defer func() {
+						if recover() != nil {
+							atomic.AddInt32(&panics, 1)
+						}
+					}()
+					r.processWithHandlerRelease(ctx, message, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil }, func() {}, func(error) {}, true, plan)
+				}(message, plans[i])
+			}
+			joined := make(chan struct{})
+			go func() { workers.Wait(); close(joined) }()
+			select {
+			case <-joined:
+			case <-ctx.Done():
+				t.Fatal("abnormal initial confirmation stranded its successor")
+			}
+			if handlers != 1 || len(base.settleSnapshot()) != 1 || (kind == "panic" && panics != 1) {
+				t.Fatal("abnormal initial confirmation changed handler or cleanup behavior")
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationDuplicateSelectedMessagesAreRejected(t *testing.T) {
+	for _, kind := range []string{"same pointer", "same positive sequence", "same zero-sequence pointer"} {
+		t.Run(kind, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			switch kind {
+			case "same pointer":
+				messages[1] = messages[0]
+			case "same positive sequence":
+				messages[1].SequenceNumber = messages[0].SequenceNumber
+			case "same zero-sequence pointer":
+				messages[0].SequenceNumber = 0
+				messages[1] = messages[0]
+			}
+			var calls, handlers, callbacks int32
+			var runCtx context.Context
+			source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+				atomic.AddInt32(&calls, 1)
+				return nil, nil
+			}
+			base.receiveFn = func(ctx context.Context, _ int, _ receiveRecord) ([]*Message, error) {
+				runCtx = ctx
+				return messages, nil
+			}
+			r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(error) {
+				atomic.AddInt32(&callbacks, 1)
+				if runCtx.Err() == nil {
+					t.Error("malformed selected batch did not stop Run before notification")
+				}
+			})})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+			if !errors.Is(err, ErrInvalidArgument) || calls != 0 || handlers != 0 || callbacks != 1 || len(base.receiveSnapshot()) != 1 || len(base.settleSnapshot()) != 0 {
+				t.Fatal("malformed selected batch reached renewal, handler or settlement")
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationPerItemStatusRespectsRunBoundary(t *testing.T) {
+	for _, status := range []int{403, 503} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var runCtx context.Context
+			base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+				if n == 1 {
+					runCtx = call
+					return messages, nil
+				}
+				<-call.Done()
+				return nil, call.Err()
+			}
+			responseErr := &HTTPError{StatusCode: status, cause: ErrPermissionDenied}
+			source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+				return []initialRenewalResult{
+					{lease: renewalLease{deadline: time.Now().Add(time.Second), clockResolution: time.Millisecond}},
+					{err: responseErr},
+				}, nil
+			}
+			var handlers, invalidHandlers, callbacks int32
+			r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(error) {
+				atomic.AddInt32(&callbacks, 1)
+				if status == 403 && runCtx.Err() == nil {
+					t.Error("per-item permanent error was notified before stopping Run")
+				}
+				if status == 503 && ctx.Err() == nil && runCtx.Err() != nil {
+					t.Error("per-item 503 permission body became permanent")
+				}
+				cancel()
+			})})
+			err := r.Run(ctx, func(_ context.Context, message *Message) error {
+				atomic.AddInt32(&handlers, 1)
+				if message.SequenceNumber == 2 {
+					atomic.AddInt32(&invalidHandlers, 1)
+				}
+				return nil
+			})
+			if callbacks == 0 || invalidHandlers != 0 {
+				t.Fatal("unconfirmed per-item result was dispatched or silently dropped")
+			}
+			if status == 403 && (err != responseErr || handlers != 0 || len(base.settleSnapshot()) != 0 || len(base.receiveSnapshot()) != 1) {
+				t.Fatal("per-item permanent error did not fence the whole dispatch")
+			}
+			if status == 503 && !errors.Is(err, context.Canceled) {
+				t.Fatalf("per-item transient error stopped Run permanently: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationLateUnsupportedFailsWindowWithoutStoppingRun(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 2)
+	deadline := time.Now().Add(80 * time.Millisecond)
+	for _, message := range messages {
+		message.localLeaseDeadline = deadline
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var runCtx context.Context
+	base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+		if n == 1 {
+			runCtx = call
+			return messages, nil
+		}
+		<-call.Done()
+		return nil, call.Err()
+	}
+	source.batchFn = func(call context.Context, _ []*Message) ([]initialRenewalResult, error) {
+		<-call.Done()
+		return nil, &HTTPError{StatusCode: 404, cause: ErrUnsupported}
+	}
+	var legacy, handlers, callbacks int32
+	source.legacyFn = func(context.Context, int64) error { atomic.AddInt32(&legacy, 1); return nil }
+	r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(err error) {
+		atomic.AddInt32(&callbacks, 1)
+		if !errors.Is(err, ErrLockLost) || (ctx.Err() == nil && runCtx.Err() != nil) {
+			t.Error("late unsupported probe replaced lease expiry with a fatal capability error")
+		}
+		cancel()
+	})})
+	err := r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+	if !errors.Is(err, context.Canceled) || legacy != 0 || handlers != 0 || callbacks == 0 || len(base.settleSnapshot()) != 0 {
+		t.Fatal("late unsupported probe acquired a fresh watchdog or dispatched work")
+	}
+}
+
+func TestInitialConfirmationCallerCancellationPreservesCanceled(t *testing.T) {
+	for _, status := range []int{404, 403} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+				if n == 1 {
+					return messages, nil
+				}
+				<-call.Done()
+				return nil, call.Err()
+			}
+			started := make(chan struct{})
+			source.batchFn = func(call context.Context, _ []*Message) ([]initialRenewalResult, error) {
+				close(started)
+				<-call.Done()
+				cause := ErrPermissionDenied
+				if status == 404 {
+					cause = ErrUnsupported
+				}
+				return nil, &HTTPError{StatusCode: status, cause: cause}
+			}
+			var handlers, callbacks int32
+			r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(error) { atomic.AddInt32(&callbacks, 1) })})
+			done := make(chan error, 1)
+			go func() {
+				done <- r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("initial batch did not start")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("late HTTP %d replaced caller cancellation: %v", status, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("canceled initial batch did not join")
+			}
+			if handlers != 0 || callbacks != 0 || len(base.settleSnapshot()) != 0 {
+				t.Fatal("canceled initial batch dispatched or reported a stale response")
+			}
+		})
+	}
+}
+
+// HTTP status controls capability detection, even when an intermediary's body
+// advertises an unrelated "unimplemented" error.
+func TestRenewalCapabilityUsesHTTPStatus(t *testing.T) {
+	for _, phase := range []string{"initial-batch", "heartbeat"} {
+		for _, tc := range []struct {
+			name     string
+			status   int
+			fallback bool
+		}{
+			{"unavailable", 503, false}, {"rate-limit", 429, false},
+			{"canceled", 499, false}, {"timeout", 408, false},
+			{"internal", 500, false}, {"invalid", 400, false},
+			{"unauthenticated", 401, false}, {"permission", 403, false},
+			{"missing-route", 404, true}, {"not-implemented", 501, false},
+		} {
+			t.Run(phase+"/"+tc.name, func(t *testing.T) {
+				var mu sync.Mutex
+				var batches, singles int
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					switch req.URL.Path {
+					case wire.PathRenewBatch:
+						var request wire.RenewBatchRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Errorf("renew request: %v", err)
+							w.WriteHeader(http.StatusBadRequest)
+							return
+						}
+						mu.Lock()
+						batches++
+						call := batches
+						mu.Unlock()
+						if call == 1 {
+							w.WriteHeader(tc.status)
+							if tc.fallback {
+								_, _ = io.WriteString(w, `{"code":"not_found","message":"no such path: /mqlite.v1.QueueService/RenewBatch"}`)
+							} else {
+								_, _ = io.WriteString(w, `{"code":"unimplemented","message":"proxy response"}`)
+							}
+							return
+						}
+						results := make([]wire.SettleItemResult, len(request.Messages))
+						for i, item := range request.Messages {
+							results[i] = wire.SettleItemResult{SeqNumber: item.SeqNumber, Ok: true, LockedUntilMs: time.Now().Add(30*time.Second).UnixNano() / int64(time.Millisecond)}
+						}
+						_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: results})
+					case wire.PathRenew:
+						mu.Lock()
+						singles++
+						mu.Unlock()
+						_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+					default:
+						t.Errorf("unexpected request path %s", req.URL.Path)
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				defer server.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				client, err := Open(ctx, server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				receiver := client.Receiver("jobs", WithAutoRenew())
+				messages := []*Message{
+					{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "jobs", lockToken: "one", s: client},
+					{SequenceNumber: 2, LockedUntil: time.Now().Add(30 * time.Second), queue: "jobs", lockToken: "two", s: client},
+				}
+				for attempt := 0; attempt < 2; attempt++ {
+					if phase == "initial-batch" {
+						_, _ = receiver.prepareInitialRenewals(ctx, messages, true)
+					} else {
+						_, _ = receiver.renewMessage(ctx, messages[0], 30*time.Second, renewalLease{})
+					}
+					receiver.renewCapabilityMu.Lock()
+					unsupported := receiver.renewBatchUnsupported
+					receiver.renewCapabilityMu.Unlock()
+					if unsupported != tc.fallback {
+						t.Fatalf("status %d cached unsupported=%t, want %t", tc.status, unsupported, tc.fallback)
+					}
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				wantBatches, wantSingles := 2, 0
+				if tc.fallback {
+					wantBatches = 1
+					if phase == "heartbeat" {
+						wantSingles = 2
+					}
+				}
+				if batches != wantBatches || singles != wantSingles {
+					t.Fatalf("requests: RenewBatch=%d Renew=%d, want %d/%d", batches, singles, wantBatches, wantSingles)
+				}
+			})
+		}
+	}
+}
+
+type legacyRenewObservedTransport struct {
+	next    http.RoundTripper
+	observe func(*http.Request)
+}
+
+func (t legacyRenewObservedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.observe(req)
+	return t.next.RoundTrip(req)
+}
+
+// Repeated successful legacy Renew replies carry no deadline. Their network
+// latency must reduce this RPC's remaining window, not the next lease estimate.
+func TestLegacyRenewRetainsLeaseEstimate(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		hangAt       int
+		wantComplete bool
+	}{
+		{"repeated-success", 0, true},
+		{"hung-renewal-still-obeys-watchdog", 3, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var claimed bool
+			var lockedUntil time.Time
+			var renews, batches, completes int
+			var callbackErrors []error
+			type observedDeadline struct {
+				deadline, actualLease time.Time
+				present               bool
+			}
+			var deadlines []observedDeadline
+			settled := make(chan struct{}, 1)
+			stopServer := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Mqlite-Server-Time-Ms", strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
+				switch req.URL.Path {
+				case "/mqlite.v1.QueueService/Receive":
+					mu.Lock()
+					if claimed {
+						mu.Unlock()
+						select {
+						case <-req.Context().Done():
+						case <-stopServer:
+						}
+						return
+					}
+					claimed = true
+					// This delivery has already spent 100ms of its one-second lease.
+					// Renew below always grants the full one-second duration.
+					lockedUntil = time.Now().Add(900 * time.Millisecond)
+					deadline := lockedUntil.UnixNano() / int64(time.Millisecond)
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"messages": []interface{}{map[string]interface{}{
+						"seq_number": 1, "body": "eA==", "lock_token": "legacy-token", "locked_until_ms": deadline,
+					}}})
+				case "/mqlite.v1.QueueService/RenewBatch":
+					mu.Lock()
+					batches++
+					mu.Unlock()
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = fmt.Fprint(w, `{"message":"no such path: RenewBatch"}`)
+				case "/mqlite.v1.QueueService/Renew":
+					mu.Lock()
+					renews++
+					call := renews
+					mu.Unlock()
+					if call == tc.hangAt {
+						select {
+						case <-req.Context().Done():
+						case <-stopServer:
+						}
+						return
+					}
+					mu.Lock()
+					valid := time.Now().Before(lockedUntil)
+					if valid {
+						lockedUntil = time.Now().Add(time.Second)
+					}
+					mu.Unlock()
+					if !valid {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = fmt.Fprint(w, `{"code":"lock_lost"}`)
+						return
+					}
+					// Delay the response after the broker has extended the lock, so
+					// the watchdog must account for response-path network latency.
+					select {
+					case <-time.After(200 * time.Millisecond):
+					case <-req.Context().Done():
+						return
+					}
+					_, _ = fmt.Fprint(w, `{"ok":true}`)
+				case "/mqlite.v1.QueueService/Complete":
+					mu.Lock()
+					valid := time.Now().Before(lockedUntil)
+					if valid {
+						completes++
+					}
+					mu.Unlock()
+					if !valid {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = fmt.Fprint(w, `{"code":"lock_lost"}`)
+						return
+					}
+					_, _ = fmt.Fprint(w, `{"ok":true}`)
+					settled <- struct{}{}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			defer close(stopServer)
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			defer transport.CloseIdleConnections()
+			observed := legacyRenewObservedTransport{next: transport, observe: func(req *http.Request) {
+				if req.URL.Path != "/mqlite.v1.QueueService/Renew" {
+					return
+				}
+				deadline, present := req.Context().Deadline()
+				mu.Lock()
+				deadlines = append(deadlines, observedDeadline{deadline: deadline, actualLease: lockedUntil, present: present})
+				mu.Unlock()
+			}}
+			client, err := Open(ctx, server.URL, WithHTTPClient(&http.Client{Transport: observed}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			type handlerResult struct {
+				completed bool
+				remaining time.Duration
+			}
+			handlerExit := make(chan handlerResult, 1)
+			runDone := make(chan error, 1)
+			receiver := client.Receiver("jobs", WithAutoRenew(), WithErrorHandler(func(err error) {
+				mu.Lock()
+				callbackErrors = append(callbackErrors, err)
+				mu.Unlock()
+			}))
+			go func() {
+				runDone <- receiver.Run(ctx, func(handlerCtx context.Context, _ *Message) error {
+					var result error
+					completed := false
+					select {
+					case <-time.After(4 * time.Second):
+						completed = true
+					case <-handlerCtx.Done():
+						result = handlerCtx.Err()
+					}
+					mu.Lock()
+					remaining := time.Until(lockedUntil)
+					mu.Unlock()
+					handlerExit <- handlerResult{completed: completed, remaining: remaining}
+					return result
+				})
+			}()
+			var outcome handlerResult
+			select {
+			case outcome = <-handlerExit:
+			case <-ctx.Done():
+				t.Fatal("handler did not finish within the test budget")
+			}
+			if outcome.completed {
+				select {
+				case <-settled:
+				case <-ctx.Done():
+					t.Fatal("completed handler did not settle")
+				}
+			}
+			callerErr := ctx.Err()
+			cancel()
+			if err := <-runDone; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run returned %v", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			t.Logf("completed=%t remaining=%s renews=%d batch_probes=%d completes=%d callbacks=%v", outcome.completed, outcome.remaining, renews, batches, completes, callbackErrors)
+			if batches != 1 || outcome.completed != tc.wantComplete {
+				t.Fatalf("legacy renewal outcome: completed=%t want=%t; batch probes=%d", outcome.completed, tc.wantComplete, batches)
+			}
+			if tc.wantComplete && (completes != 1 || renews < 5 || len(callbackErrors) != 0) {
+				t.Fatalf("successful renewals did not retain the lease: complete=%d renews=%d callbacks=%v", completes, renews, callbackErrors)
+			}
+			if tc.hangAt > 0 {
+				if len(deadlines) < tc.hangAt {
+					t.Fatalf("missing hung request deadline: %d", len(deadlines))
+				}
+				captured := deadlines[tc.hangAt-1]
+				if !captured.present || captured.deadline.After(captured.actualLease) {
+					t.Fatalf("hung request watchdog %s exceeds the last confirmed real lease %s", captured.deadline, captured.actualLease)
+				}
+			}
+			if !tc.wantComplete && (completes != 0 || len(callbackErrors) != 1 || !errors.Is(callbackErrors[0], ErrLockLost) || callerErr != nil) {
+				t.Fatalf("hung renewal did not stop independently or settled: complete=%d remaining=%s caller=%v callbacks=%v", completes, outcome.remaining, callerErr, callbackErrors)
+			}
+		})
 	}
 }

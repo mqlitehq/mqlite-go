@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+- Keep a fixed conservative lease-duration estimate when legacy `Renew` returns
+  no deadline. Repeated successful renewals no longer subtract each network
+  round trip from every future lease window; each request keeps its own watchdog.
+
+- Preserve the original nontransient renewal error category during initial
+  confirmation, handler execution and settlement confirmation (MQLITE-192).
+- Validate Send sequence domains once in the wire decoder while retaining
+  operation-specific acknowledgement counts (MQLITE-193).
+
+- Reject negative or null sequence-number slots in successful Send acknowledgements
+  as `ErrOutcomeUnknown`, without replaying the request. Preserve valid zero
+  results for unmatched topic publishes and duplicate positive results from dedup
+  (MQLITE-188).
+
+- Confirm received messages that need an initial lease check in one fenced
+  `RenewBatch` request before dispatching handlers. Preserve the earliest
+  original watchdog and each message's ownership checks; older brokers retain
+  bounded, ordered single-message confirmation (MQLITE-183).
+
+- With auto-renew enabled, protect a returned handler's lease through the existing
+  bounded Complete/Abandon confirmation budget, including Run cancellation during
+  settlement. Resolve a post-commit renewal loss through the exact settlement
+  acknowledgement or receipt replay; preserve final errors and Unknown outcomes.
+  Permanent renewal failures still stop receiving immediately. On normal handler
+  return, join an in-flight renewal and adopt its acknowledgement without
+  canceling and reissuing it. Handoff shares the existing confirmation budget;
+  Run cancellation, budget expiry and abnormal exits still cancel and join it.
+
+- Use a valid `X-Mqlite-Server-Elapsed-Ms` response header to exclude broker
+  processing from lease clock uncertainty, keeping long polls and storage waits
+  from being charged twice. Renewal scheduling retains the full RPC duration.
+  Missing, repeated, malformed or excessive values retain the full-RTT bound.
+
+- Give managed Complete and Abandon confirmation a fresh 30-second total budget
+  with fifteen seconds per attempt, so a slow committed request can replay its exact
+  acknowledgement without rerunning the handler. Exhausted transient failures
+  report `ErrOutcomeUnknown` while retaining the last transport or HTTP cause.
+  Shutdown joins this cooperative cleanup even after `Run` cancellation.
+
+- Write the complete `mqlitec receive` JSON batch before auto-completing any
+  message (MQLITE-148). Failed or partial stdout writes now leave the batch
+  unsettled; a closed stdout or null-device redirect is refused before claiming.
+  `--no-ack` continues to print lock tokens without settlement. Document the
+  at-least-once boundary when output succeeds but completion or a pipe reader
+  later fails.
+
+- Reject null Receive items, nonpositive or repeated delivery sequences, and
+  Peek-Lock deliveries without a fencing token before exposing
+  any part of a batch (MQLITE-153). A damaged receive-and-delete response returns
+  `ErrOutcomeUnknown`; managed normal Receive retains safe same-attempt replay.
+  Reject null or negative
+  Send/Schedule acknowledgement sequences while preserving legitimate zero
+  results, empty message bodies, empty Receive lists, and tokenless
+  ReceiveAndDelete/Peek responses. Deferred delivery always requires a token;
+  distinct message sequences do not require globally unique tokens.
+
+- Reject negative or positive sub-millisecond `Message.Abandon` delays before
+  sending an HTTP request (MQLITE-156). Zero remains immediate; valid positive
+  delays retain their existing millisecond precision and settlement identity.
+
+- Clarify quick-start queue and permission prerequisites, disabled-by-default
+  deduplication, per-item batch results, broker-version permissions, and owned
+  versus wrapped HTTP transport lifecycles. Distinguish Bearer credentials from
+  the lock tokens intentionally printed by `mqlitec receive --no-ack`.
+
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`

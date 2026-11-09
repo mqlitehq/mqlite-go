@@ -9,7 +9,8 @@ import (
 
 // Unary RPC paths. Every operation is one JSON HTTP POST.
 const (
-	ServerTimeHeader = "X-Mqlite-Server-Time-Ms"
+	ServerTimeHeader    = "X-Mqlite-Server-Time-Ms"
+	ServerElapsedHeader = "X-Mqlite-Server-Elapsed-Ms"
 
 	PathSend            = "/mqlite.v1.QueueService/Send"
 	PathReceive         = "/mqlite.v1.QueueService/Receive"
@@ -100,6 +101,28 @@ type SendResponse struct {
 	SeqNumbers []int64 `json:"seq_numbers"`
 }
 
+// UnmarshalJSON rejects impossible acknowledgements while preserving sequence
+// zero for topic publishes without a match and skipped batch dedup slots.
+func (r *SendResponse) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		SeqNumbers []*int64 `json:"seq_numbers"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	sequences := make([]int64, len(decoded.SeqNumbers))
+	for i, sequence := range decoded.SeqNumbers {
+		// A null item otherwise decodes as zero and impersonates a legitimate
+		// topic no-match or skipped batch slot.
+		if sequence == nil || *sequence < 0 {
+			return errors.New("mqlite: send response contains an invalid sequence number")
+		}
+		sequences[i] = *sequence
+	}
+	r.SeqNumbers = sequences
+	return nil
+}
+
 type ReceiveRequest struct {
 	Queue       string `json:"queue"`
 	MaxMessages int    `json:"max_messages,omitempty"`
@@ -125,6 +148,19 @@ func (r *ReceiveResponse) UnmarshalJSON(data []byte) error {
 	}
 	if raw.Messages == nil {
 		return errors.New("mqlite: receive response is missing messages")
+	}
+	// A null item decodes into a zero-valued Message. Every actual delivery
+	// has a positive sequence, including a valid empty-body delivery. Reject
+	// the whole batch before exposing any prefix to the caller.
+	seen := make(map[int64]bool, len(*raw.Messages))
+	for _, message := range *raw.Messages {
+		if message.SeqNumber <= 0 {
+			return errors.New("mqlite: receive response contains an invalid message sequence")
+		}
+		if seen[message.SeqNumber] {
+			return errors.New("mqlite: receive response contains a repeated message sequence")
+		}
+		seen[message.SeqNumber] = true
 	}
 	r.Messages = *raw.Messages
 	return nil

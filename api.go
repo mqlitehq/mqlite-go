@@ -99,9 +99,11 @@ func (c *Client) SendOne(ctx context.Context, queue string, message OutMessage, 
 	return response.SeqNumbers[0], nil
 }
 
-// Send atomically enqueues one or more messages. An empty batch is a no-op. An
-// invalid successful acknowledgement returns ErrOutcomeUnknown because the
-// batch may already have committed; reconcile before retrying.
+// Send enqueues one or more messages in one transaction. An empty batch is a
+// no-op. With queue deduplication enabled, a conflicting item can return sequence
+// zero while other items commit; inspect every result. An invalid successful
+// acknowledgement returns ErrOutcomeUnknown because the batch may already have
+// committed; reconcile before retrying.
 func (c *Client) Send(ctx context.Context, queue string, messages ...OutMessage) ([]int64, error) {
 	if len(messages) == 0 {
 		return nil, nil
@@ -273,28 +275,43 @@ func (c *Client) renewBatchObserved(ctx context.Context, queue string, messages 
 // public single-message Renew route predates deadline responses, while
 // RenewBatch reports the committed lease deadline even for one item.
 func (c *Client) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
-	results, observation, err := c.renewBatchObserved(ctx, message.queue, message)
+	results, err := c.renewInitialBatch(ctx, message.queue, []*Message{message})
 	if err != nil {
 		return renewalLease{}, err
 	}
-	if len(results) != 1 || !results[0].Ok {
+	if len(results) != 1 {
 		return renewalLease{}, ErrLockLost
 	}
-	lease := renewalLease{
-		responseRTT:      observation.responseRTT,
-		clockResolution:  observation.resolution,
-		clockUnavailable: observation.serverUpper.IsZero(),
+	return results[0].lease, results[0].err
+}
+
+func (c *Client) renewInitialBatch(ctx context.Context, queue string, messages []*Message) ([]initialRenewalResult, error) {
+	results, observation, err := c.renewBatchObserved(ctx, queue, messages...)
+	if err != nil {
+		return nil, err
 	}
-	if deadline, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
-		lease.deadline = deadline
-		return lease, nil
+	confirmed := make([]initialRenewalResult, len(results))
+	for i, result := range results {
+		if !result.Ok {
+			confirmed[i].err = ErrLockLost
+			continue
+		}
+		lease := renewalLease{responseRTT: observation.responseRTT, clockResolution: observation.resolution,
+			clockUnavailable: observation.serverUpper.IsZero()}
+		if deadline, ok := observation.localLeaseDeadline(result.LockedUntil); ok {
+			lease.deadline = deadline
+		} else {
+			lease.deadline = result.LockedUntil
+		}
+		confirmed[i].lease = lease
 	}
-	lease.deadline = results[0].LockedUntil
-	return lease, nil
+	return confirmed, nil
 }
 
 // Receive claims messages with Peek-Lock by default. Pick retrieves deferred
-// sequence numbers, and AtMostOnce uses receive-and-delete.
+// sequence numbers with Peek-Lock even when AtMostOnce is true. Otherwise,
+// AtMostOnce uses receive-and-delete. A call does not retry or renew locks;
+// Receiver.Run provides managed retries and optional renewal.
 func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([]*Message, error) {
 	option := receiveOption(opts)
 	if option.Wait < 0 {
@@ -327,6 +344,13 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
+	// Deferred delivery is always Peek-Lock, even if another receive option is
+	// also set. Validate ownership before constructing any message handles.
+	if len(option.Pick) > 0 || option.mode() == receivePeekLock {
+		if err := validatePeekLockMessages(response.Messages); err != nil {
+			return nil, err
+		}
+	}
 	return c.messagesFromWire(queue, response.Messages, observation), nil
 }
 
@@ -339,7 +363,21 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	if err != nil {
 		return nil, err
 	}
+	if mode == receivePeekLock {
+		if err := validatePeekLockMessages(response.Messages); err != nil {
+			return nil, err
+		}
+	}
 	return c.messagesFromWire(queue, response.Messages, observation), nil
+}
+
+func validatePeekLockMessages(messages []wire.Message) error {
+	for _, message := range messages {
+		if message.LockToken == "" {
+			return &invalidSuccessResponseError{cause: errors.New("mqlite: peek-lock response contains a message without a lock token")}
+		}
+	}
+	return nil
 }
 
 func (c *Client) messagesFromWire(queue string, messages []wire.Message, observation serverClockObservation) []*Message {

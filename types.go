@@ -221,8 +221,10 @@ type RecvOpts struct {
 	Max        int
 	Wait       time.Duration
 	AtMostOnce bool
-	Attempt    string
-	Pick       []int64
+	// Attempt is reused with the identical normal Receive request only when its
+	// response was unavailable. Use a new ID after a valid response. Pick ignores it.
+	Attempt string
+	Pick    []int64
 }
 
 func (o RecvOpts) mode() receiveMode {
