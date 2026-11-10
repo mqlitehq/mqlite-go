@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve a fixed conservative lease estimate when legacy `Renew` replies carry
+  no deadline. Repeated successful renewals no longer shorten later lease
+  windows; each request still obeys its own bounded watchdog (MQLITE-196).
+
 - Bound managed Receive reconnection: keep one receive-attempt ID, replay the
   first transient failure with no client-generated delay, then use equal-jitter
   exponential delays with a 500ms base and 3s generated cap. Valid `Retry-After`
