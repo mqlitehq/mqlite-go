@@ -45,6 +45,38 @@ CI additionally compiles and tests with Go 1.13.15, Go 1.18.10, and current
 stable. A release tag must equal `v` plus `internal/version.Version`, must point
 at a green main commit, and publishes only binaries built with supported stable.
 
+## Change verification and release acceptance
+
+- For every code-change candidate, run targeted functional and new regression
+  tests, the complete existing race suite, build/vet/format checks, and
+  `go mod tidy` with no diff. Verify standard-library-only dependencies and
+  actual Go 1.13.15 compatibility; record which platform checks CI supplies.
+  Cover affected behavior with the broker and native SDK parity scenarios.
+- Require every candidate CI job to pass before merge. After merge, verify the
+  actual main SHA and all required push CI jobs (currently 11) passing in one
+  run/attempt, plus the broker/client combination. Prior PR greens do not replace
+  that evidence. Record skips, missing and unavailable checks without calling them passes.
+- Exercise local performance and sustained stress against a comparison baseline.
+  Declare durations, workload, leases, budgets, resource limits and acceptance
+  criteria before execution. Use Actions for dedicated real-backend verification
+  through the broker; never add engine or database dependencies to this SDK.
+- Verify exact message identities/payloads, settlement, expected redelivery/DLQ,
+  resource bounds, cancellation, shutdown and restart. Preserve first failures and
+  diagnose them before rerunning; do not relax budgets or assertions to turn green.
+  Functional nightly success and read-only CI monitoring are not performance soaks.
+- Freeze source revisions, artifact digests, harness and configuration before final
+  acceptance. Coordinate with the broker's production checklist: at least 24 hours
+  of supervised workload, or the maintainer's stricter plan. Changes require renewed
+  verification; never splice different sources or windows into a pass. Review the
+  scope of documentation-only changes explicitly without inventing runtime evidence.
+- Accept final evidence only after supervised completion, drain, exact ledgers,
+  integrity/restore checks and resource review. A short smoke, runner-only PASS,
+  skipped test or infrastructure/read error does not close an unverified gate.
+  Keep credentials and private deployment details out of published evidence.
+- Obtain separate, explicit maintainer approval before creating a tag or Release.
+  Prepare concise English release notes from the last tag's net changes, with
+  accurate compatibility, upgrade guidance, verified coverage and known limits.
+
 ## Repository shape
 
 - Root package: public remote SDK.
