@@ -1,13 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/mqlitehq/mqlite-go"
 )
 
 func runAgainst(t *testing.T, handler http.Handler, args ...string) (string, error) {
@@ -160,6 +168,243 @@ func TestReceiveCommandCompletesMessages(t *testing.T) {
 	}
 	if strings.Contains(output, "lock-5") {
 		t.Fatalf("default output exposed lock token: %q", output)
+	}
+}
+
+func TestReceiveCommandWritesWholeBatchBeforeSettlement(t *testing.T) {
+	output, err := ioutil.TempFile("", "mqlitec-receive-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(output.Name())
+	defer output.Close()
+	old := os.Stdout
+	os.Stdout = output
+	defer func() { os.Stdout = old }()
+	var completed int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mqlite.v1.QueueService/Receive":
+			_, _ = w.Write([]byte(`{"messages":[{"seq_number":5,"body":"aGVsbG8=","lock_token":"lock-5"},{"seq_number":6,"body":"d29ybGQ=","lock_token":"lock-6"}]}`))
+		case "/mqlite.v1.QueueService/Complete":
+			data, readErr := ioutil.ReadFile(output.Name())
+			var result struct {
+				Messages []struct{ Body string } `json:"messages"`
+			}
+			if readErr != nil || json.Unmarshal(data, &result) != nil || len(result.Messages) != 2 ||
+				result.Messages[0].Body != "hello" || result.Messages[1].Body != "world" {
+				t.Errorf("Complete began before the complete batch was written: output=%q, read error=%v", data, readErr)
+			}
+			if bytes.Contains(data, []byte("lock-")) {
+				t.Error("auto-ack output exposed lock tokens")
+			}
+			atomic.AddInt32(&completed, 1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	if err := run([]string{"--endpoint", server.URL, "receive", "--max", "2", "orders"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&completed); got != 2 {
+		t.Fatalf("Complete calls = %d, want 2", got)
+	}
+}
+
+func TestReceiveCommandOutputFailureDoesNotComplete(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprintf("partial=%v", partial), func(t *testing.T) {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Close()
+			readDone := make(chan struct{})
+			if partial {
+				go func() {
+					defer close(readDone)
+					defer reader.Close()
+					var prefix [32]byte
+					_, _ = reader.Read(prefix[:])
+				}()
+			} else {
+				_ = reader.Close()
+				close(readDone)
+			}
+			old := os.Stdout
+			os.Stdout = writer
+			defer func() { os.Stdout = old }()
+			var completed int32
+			// Exceed even the usual Linux 1 MiB pipe-capacity ceiling so the
+			// partial reader must close before the complete batch can be written.
+			body := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("x"), 2*1024*1024))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/mqlite.v1.QueueService/Receive":
+					_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":5,"body":%q,"lock_token":"lock-5"},{"seq_number":6,"body":"d29ybGQ=","lock_token":"lock-6"}]}`, body)
+				case "/mqlite.v1.QueueService/Complete":
+					atomic.AddInt32(&completed, 1)
+					_, _ = w.Write([]byte(`{"ok":true}`))
+				default:
+					t.Errorf("unexpected path %q", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			if err := run([]string{"--endpoint", server.URL, "receive", "--max", "2", "orders"}); err == nil {
+				t.Fatal("receive with broken output succeeded")
+			}
+			<-readDone
+			if got := atomic.LoadInt32(&completed); got != 0 {
+				t.Fatalf("Complete calls after output failure = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestReceiveCommandNoAckKeepsLockTokens(t *testing.T) {
+	var completed int32
+	output, err := runAgainst(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/Receive") {
+			_, _ = w.Write([]byte(`{"messages":[{"seq_number":5,"body":"aGVsbG8=","lock_token":"lock-5"}]}`))
+		} else {
+			atomic.AddInt32(&completed, 1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}), "receive", "--no-ack", "orders")
+	if err != nil || !strings.Contains(output, "lock-5") || atomic.LoadInt32(&completed) != 0 {
+		t.Fatalf("no-ack output=%q, err=%v, settlements=%d", output, err, completed)
+	}
+}
+
+func TestReceiveCommandClosedStdoutDoesNotClaim(t *testing.T) {
+	output, err := ioutil.TempFile("", "mqlitec-closed-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(output.Name())
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = output
+	defer func() { os.Stdout = old }()
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = w.Write([]byte(`{"messages":[]}`))
+	}))
+	defer server.Close()
+	if err := run([]string{"--endpoint", server.URL, "receive", "orders"}); err == nil {
+		t.Fatal("receive with a closed stdout succeeded")
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("RPC calls with closed stdout = %d, want 0", got)
+	}
+}
+
+func TestReceiveCommandUnknownSettlementPreservesWholeBatch(t *testing.T) {
+	var completed int32
+	output, err := runAgainst(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mqlite.v1.QueueService/Receive":
+			_, _ = w.Write([]byte(`{"messages":[{"seq_number":5,"body":"aGVsbG8=","lock_token":"lock-5"},{"seq_number":6,"body":"d29ybGQ=","lock_token":"lock-6"}]}`))
+		case "/mqlite.v1.QueueService/Complete":
+			var request struct {
+				SeqNumber int64 `json:"seq_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode Complete: %v", err)
+			}
+			n := atomic.AddInt32(&completed, 1)
+			if want := int64(4 + n); request.SeqNumber != want {
+				t.Errorf("Complete sequence = %d, want %d", request.SeqNumber, want)
+			}
+			if n == 1 {
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			} else {
+				// A malformed success reply cannot establish whether the second
+				// settlement committed. Preserve the typed unknown outcome.
+				_, _ = w.Write([]byte(`{"ok":`))
+			}
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}), "receive", "--max", "2", "orders")
+	if !errors.Is(err, mqlite.ErrOutcomeUnknown) || !strings.Contains(err.Error(), "complete sequence 6") {
+		t.Fatalf("settlement error = %v, want wrapped unknown outcome for sequence 6", err)
+	}
+	var result struct {
+		Messages []struct{ Body string } `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil || len(result.Messages) != 2 ||
+		result.Messages[0].Body != "hello" || result.Messages[1].Body != "world" {
+		t.Fatalf("whole printed batch missing after uncertain settlement: output=%q, decode error=%v", output, err)
+	}
+	if got := atomic.LoadInt32(&completed); got != 2 {
+		t.Fatalf("Complete calls = %d, want 2 without replay", got)
+	}
+}
+
+func TestReceiveCommandSettlementFailurePreservesPrintedBatch(t *testing.T) {
+	output, err := runAgainst(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/Receive") {
+			_, _ = w.Write([]byte(`{"messages":[{"seq_number":5,"body":"aGVsbG8=","lock_token":"lock-5"}]}`))
+		} else {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":"lock_lost","message":"lease expired"}`))
+		}
+	}), "receive", "orders")
+	if err == nil || !strings.Contains(err.Error(), "complete sequence 5") || !strings.Contains(output, `"body": "hello"`) {
+		t.Fatalf("output=%q, settlement error=%v", output, err)
+	}
+}
+
+func TestReceiveCommandBrokenStdoutProcess(t *testing.T) {
+	// Re-exec the test binary to exercise the real fd 1/SIGPIPE behavior without
+	// killing the test runner. A broken pipe must never reach Complete.
+	if endpoint := os.Getenv("MQLITEC_OUTPUT_TEST_ENDPOINT"); endpoint != "" {
+		os.Args = []string{"mqlitec", "--endpoint", endpoint, "receive", "orders"}
+		main()
+		return
+	}
+	var received, completed int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/Receive") {
+			atomic.AddInt32(&received, 1)
+			_, _ = w.Write([]byte(`{"messages":[{"seq_number":5,"body":"aGVsbG8=","lock_token":"lock-5"}]}`))
+		} else {
+			atomic.AddInt32(&completed, 1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer server.Close()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reader.Close()
+	defer writer.Close()
+	command := exec.Command(os.Args[0], "-test.run=^TestReceiveCommandBrokenStdoutProcess$")
+	command.Env = append(os.Environ(), "MQLITEC_OUTPUT_TEST_ENDPOINT="+server.URL)
+	command.Stdout = writer
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Run(); err == nil {
+		t.Fatal("process with a broken stdout pipe exited successfully")
+	}
+	if atomic.LoadInt32(&received) != 1 || atomic.LoadInt32(&completed) != 0 {
+		t.Fatalf("broken-pipe process Receive=%d, Complete=%d, stderr=%q", received, completed, stderr.String())
 	}
 }
 
