@@ -35,10 +35,18 @@ as JSON.
 
 `send` accepts `--message-id`, `--subject`, and `--ttl`. It requires `send`.
 
-`receive` accepts `--max`, `--wait`, and `--no-ack`. The default completes every
-returned message before emitting the JSON result. Use it only when printing the
-body is the intended processing action. `--no-ack` leaves the delivery locked
-and prints its lock token for deliberate diagnostics. It requires `listen`.
+`receive` accepts `--max`, `--wait`, and `--no-ack`. The default writes the complete
+JSON batch to stdout before completing any returned message. A closed stdout
+handle is rejected before claiming. If output fails, including after a partial
+write, none of that batch is completed; its messages remain locked until normal
+lease expiry and can then be redelivered or reach the delivery limit.
+Use auto-ack only when printing the body is the intended processing action.
+A successful write means the operating system accepted the bytes; it does not
+confirm that a downstream program processed or persisted them. If completion
+fails after output, the command exits nonzero. Earlier completions in the batch
+may already have succeeded, and messages without confirmed settlement may be
+redelivered, so processing must remain idempotent. `--no-ack` leaves deliveries
+locked and prints lock tokens for deliberate diagnostics. It requires `listen`.
 
 `subscribe` accepts `--expr` and `--ttl`. TTL is fixed at first creation and is
 not renewed by traffic or updates. Permission is broker-version dependent; the

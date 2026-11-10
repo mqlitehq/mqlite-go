@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Write the complete `mqlitec receive` JSON batch before auto-completing any
+  message (MQLITE-148). Failed or partial stdout writes leave the whole batch
+  unsettled, and a closed stdout handle is rejected before claiming. Preserve
+  printed output and the error when subsequent settlement fails.
+
 - Preserve a fixed conservative lease estimate when legacy `Renew` replies carry
   no deadline. Repeated successful renewals no longer shorten later lease
   windows; each request still obeys its own bounded watchdog (MQLITE-196).

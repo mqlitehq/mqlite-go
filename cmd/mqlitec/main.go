@@ -147,6 +147,11 @@ func receive(ctx context.Context, client *mqlite.Client, args []string) error {
 	if len(pos) != 1 {
 		return errors.New("usage: mqlitec receive [flags] <queue-or-subscription>")
 	}
+	if !*noAck {
+		if _, err := os.Stdout.Stat(); err != nil {
+			return fmt.Errorf("stdout unavailable; refusing to auto-acknowledge messages: %w", err)
+		}
+	}
 	messages, err := client.Receive(ctx, pos[0], mqlite.RecvOpts{Max: *max, Wait: *wait})
 	if err != nil {
 		return err
@@ -176,15 +181,23 @@ func receive(ctx context.Context, client *mqlite.Client, args []string) error {
 		}
 		if *noAck {
 			items[i].LockToken = message.LockToken()
-			continue
-		}
-		if err := message.Complete(ctx); err != nil {
-			return fmt.Errorf("complete sequence %d: %w", message.SequenceNumber, err)
 		}
 	}
-	return writeJSON(struct {
+	// Write the whole batch before acknowledging any message (MQLITE-148).
+	// A partial output must leave every delivery unsettled for ordinary expiry.
+	if err := writeJSON(struct {
 		Messages []output `json:"messages"`
-	}{Messages: items})
+	}{Messages: items}); err != nil {
+		return err
+	}
+	if !*noAck {
+		for _, message := range messages {
+			if err := message.Complete(ctx); err != nil {
+				return fmt.Errorf("complete sequence %d: %w", message.SequenceNumber, err)
+			}
+		}
+	}
+	return nil
 }
 
 func subscribe(ctx context.Context, client *mqlite.Client, args []string) error {
