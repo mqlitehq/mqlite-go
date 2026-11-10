@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Reject negative and JSON null sequence entries in successful Send replies
+  (MQLITE-188). Such malformed acknowledgements return `ErrOutcomeUnknown` without
+  replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
+
+
 - Write the complete `mqlitec receive` JSON batch before auto-completing any
   message (MQLITE-148). Failed or partial stdout writes leave the whole batch
   unsettled, and a closed stdout handle is rejected before claiming. Preserve
