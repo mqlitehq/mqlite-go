@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Validate each received batch before exposing any message: reject null entries,
+  nonpositive or repeated sequence numbers, and missing Peek-Lock fencing tokens.
+  Preserve valid empty bodies, empty batches and tokenless ReceiveAndDelete.
+  A malformed destructive Receive remains `ErrOutcomeUnknown`; managed Peek-Lock
+  recovery keeps the original receive-attempt ID without dispatching a prefix.
+
 - Reject negative and JSON null sequence entries in successful Send replies
   (MQLITE-188). Such malformed acknowledgements return `ErrOutcomeUnknown` without
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
