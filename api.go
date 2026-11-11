@@ -327,6 +327,12 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
+	if err := validateDeliveryBatch(response.Messages, len(option.Pick) > 0 || !option.AtMostOnce); err != nil {
+		if len(option.Pick) == 0 && option.AtMostOnce {
+			return nil, &ambiguousOutcomeError{operation: "ReceiveAtMostOnce", cause: err}
+		}
+		return nil, err
+	}
 	return c.messagesFromWire(queue, response.Messages, observation), nil
 }
 
@@ -339,7 +345,32 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	if err != nil {
 		return nil, err
 	}
+	if err := validateDeliveryBatch(response.Messages, mode == receivePeekLock); err != nil {
+		return nil, err
+	}
 	return c.messagesFromWire(queue, response.Messages, observation), nil
+}
+
+// Validate the whole batch before exposing any delivery. Missing/null messages
+// decode as a zero identity; sequence order, empty bodies and server time remain
+// independent of this ownership check.
+func validateDeliveryBatch(messages []wire.Message, peekLock bool) error {
+	var seen map[int64]struct{}
+	if len(messages) > 1 {
+		seen = make(map[int64]struct{}, len(messages))
+	}
+	for _, message := range messages {
+		if message.SeqNumber <= 0 || peekLock && message.LockToken == "" {
+			return &invalidSuccessResponseError{cause: errors.New("receive response contains an invalid delivery identity")}
+		}
+		if seen != nil {
+			if _, duplicate := seen[message.SeqNumber]; duplicate {
+				return &invalidSuccessResponseError{cause: errors.New("receive response repeats a delivery identity")}
+			}
+			seen[message.SeqNumber] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func (c *Client) messagesFromWire(queue string, messages []wire.Message, observation serverClockObservation) []*Message {

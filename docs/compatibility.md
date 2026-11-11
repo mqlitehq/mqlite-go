@@ -18,7 +18,7 @@ Apple Silicon release artifacts.
 
 ## Broker compatibility
 
-The v0.1.1 client is blackbox-tested against the exact
+The v0.1.2 release-target client is blackbox-tested against the exact
 `ghcr.io/mqlitehq/mqlite:0.4.1` broker image. Core queue calls use the stable
 JSON-over-HTTP routes shared by MQLite clients. Lifecycle-aware queue/subscription
 deletion, fixed subscription TTL, and paged subscription inventory require a
@@ -31,9 +31,9 @@ request-level wire shape for compatibility.
 An older broker returns `ErrUnsupported` when a route does not exist. The SDK
 does not silently translate lifecycle calls into a less-safe legacy operation.
 
-Permissions are a broker contract, not a client-side policy. Against v0.4.1,
-subscription creation and filter testing require `manage`. Consult the selected
-broker release notes before assigning a narrower credential.
+Permissions are enforced by the broker. v0.4.1 requires `manage` for subscription
+creation and filter testing; v0.4.2 and later accept `listen`. Consult the selected
+broker release notes when assigning credentials.
 
 ## Stability
 
