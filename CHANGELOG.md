@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.2 — 2026-11-11
+
 - Validate each received batch before exposing any message: reject null entries,
   nonpositive or repeated sequence numbers, and missing Peek-Lock fencing tokens.
   Preserve valid empty bodies, empty batches and tokenless ReceiveAndDelete.

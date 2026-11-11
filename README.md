@@ -16,8 +16,11 @@ when the application only talks to a broker over HTTP and a low Go floor matters
 
 ## Install
 
+This source prepares v0.1.2. Confirm its tag on
+[Releases](https://github.com/mqlitehq/mqlite-go/releases) before installing.
+
 ```sh
-go get github.com/mqlitehq/mqlite-go@v0.1.1
+go get github.com/mqlitehq/mqlite-go@v0.1.2
 ```
 
 The module declares `go 1.13` and is tested with Go 1.13.15, Go 1.18.10, and
@@ -203,10 +206,9 @@ Managed handlers intentionally choose only Complete (`nil`) or immediate
 Abandon (non-nil error). Use an explicit `Receive` loop when one handler needs
 delayed Abandon, Reject, Defer, or receive-and-delete semantics.
 
-Authorization is enforced by the broker. The currently released MQLite v0.4.1
-requires `manage` for subscription provisioning; later broker releases may allow
-`listen` according to their release notes. This SDK does not weaken or emulate
-server permissions.
+Authorization is enforced by the broker. MQLite v0.4.1 requires `manage` for
+subscription provisioning; v0.4.2 and later accept `listen`. Check the broker's
+release notes when choosing permissions. This SDK preserves server permissions.
 
 ## Included API
 
