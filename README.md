@@ -206,6 +206,14 @@ Managed handlers intentionally choose only Complete (`nil`) or immediate
 Abandon (non-nil error). Use an explicit `Receive` loop when one handler needs
 delayed Abandon, Reject, Defer, or receive-and-delete semantics.
 
+An explicit `Message.Abandon` delay must be zero or at least 1ms. Negative and
+positive sub-millisecond values return `ErrInvalidArgument` before any request;
+other durations use the protocol's millisecond precision. Client-side rejection
+sends no request. Brokers with timestamp-range validation also reject a new delay
+whose absolute visibility timestamp would overflow. Input rejection does not
+settle an otherwise live delivery; its token remains usable while the lease is
+valid.
+
 Authorization is enforced by the broker. MQLite v0.4.1 requires `manage` for
 subscription provisioning; v0.4.2 and later accept `listen`. Check the broker's
 release notes when choosing permissions. This SDK preserves server permissions.
