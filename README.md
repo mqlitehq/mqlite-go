@@ -100,7 +100,8 @@ conservative lower bound already consumed by a long poll gets one bounded
 confirmation before dispatch. Older brokers use the standard HTTP `Date` header.
 Its one-second precision is charged against the lease, and a coarse
 horizon that cannot safely fit that precision plus measured RTT uses bounded
-untrusted confirmation. If an intermediary strips both headers, the SDK reports
+untrusted confirmation. If an intermediary strips both `X-Mqlite-Server-Time-Ms`
+and HTTP `Date`, the SDK reports
 degraded clock mode once through `WithErrorHandler`, confirms the lease before
 dispatch, and keeps using bounded untrusted confirmation instead of scheduling
 from the raw absolute `LockedUntil`. Exact leases too short to support the 50ms
@@ -115,27 +116,36 @@ renewed safely. Updating a queue changes future lease extensions only; it does
 not shorten a `LockedUntil` deadline already issued to a consumer.
 If no response-time sample yields a usable deadline, a successful renewal still
 releases the handler and the receiver uses a conservative confirmation cadence.
-The first later renewal failure cancels the handler because no safe retry window
-is known.
+While the handler is running, the first later renewal failure cancels it because
+no safe retry window is known.
 Shutdown is cooperative. Trusted renewal requests are bounded by the known lease
 window and untrusted confirmations use a one-second watchdog. Handlers and custom
 HTTP transports must honor request contexts, and an error handler must return
-promptly. The receiver waits for an in-flight renewal to exit before it settles
-the same lock token.
+promptly. On normal handler return, the receiver lets an in-flight renewal
+finish within its original ownership watchdog and joins it before handing its
+confirmed lease to the bounded settlement phase. Run cancellation, budget expiry
+and abnormal exits still cancel and join the handling heartbeat.
 Complete and Abandon use bounded exact-request retries so a lost broker response
 can be reconciled through the broker's settlement receipt without running the
-handler again. Confirmation has a fresh 30-second total budget, including retry
-waits, with at most fifteen seconds per attempt. A retry is clipped to the
-remaining total budget. It remains independent of `Run`
-cancellation, so shutdown joins that cleanup before returning. A handler or
+handler again. Confirmation has a 30-second total budget starting at handler
+return, including renewal handoff and retry waits, with at most fifteen seconds
+per attempt. A retry is clipped to the remaining total budget. It remains independent of `Run`
+cancellation. With auto-renew enabled, the heartbeat shares this confirmation
+context until settlement finishes, protecting the token while the request waits.
+A renewal can lose its token after the same settlement already committed; the
+exact acknowledgement or receipt replay determines the final outcome. Shutdown
+joins the heartbeat and confirmation before returning. A handler or
 custom HTTP transport that ignores context cancellation can still delay shutdown.
 If transient confirmation failures exhaust the budget, the error handler receives
 `ErrOutcomeUnknown` while `errors.Is` and `errors.As` retain the last transport or
-HTTP cause. Definitive failures such as `ErrLockLost` keep their own identity.
+HTTP cause. Expiry before any settlement request is issued has the local cause
+`context.DeadlineExceeded`, without implying an unknown settlement outcome.
+Definitive failures such as `ErrLockLost` keep their own identity.
 When a broker or intermediary returns HTTP 499 for a managed request, the
 Receiver treats that response as transient only while its own controlling
-context remains live. Receive reuses the same attempt ID; canceling the caller
-context never triggers another request.
+context remains live. Receive reuses the same attempt ID. Canceling Run stops new
+Receive requests; a returned handler's bounded settlement cleanup remains as
+described above.
 Managed Receive gives the first transient failure in a round no client-generated
 delay and replays it with that same attempt ID. Later failures use equal-jitter
 exponential delays with a 500ms base and a three-second generated cap. A valid
