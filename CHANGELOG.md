@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Use a valid `X-Mqlite-Server-Elapsed-Ms` response header to exclude broker
+  processing from lease clock uncertainty, keeping long polls and storage waits
+  from being charged twice. Renewal scheduling retains the full RPC duration.
+  Missing, repeated, malformed or excessive values retain the full-RTT bound.
+
 - Give managed Complete and Abandon confirmation a fresh 30-second total budget
   with fifteen seconds per attempt, so a slow committed request can replay its exact
   acknowledgement without rerunning the handler. Exhausted transient failures

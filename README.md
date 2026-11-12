@@ -146,7 +146,9 @@ same response as their clock reference, falling back to local response receipt
 time when that header is absent or malformed. `Retry-After: 0` never suppresses
 the normal later backoff. Canceling `Run` interrupts every reconnect wait. A
 successful Receive, including an empty result, ends the retry round; the next
-Receive uses a fresh attempt ID.
+Receive uses a fresh attempt ID. A valid
+`X-Mqlite-Server-Elapsed-Ms` removes broker processing from clock uncertainty;
+renewal scheduling still uses the full measured RPC duration.
 
 ## Topics and subscriptions
 

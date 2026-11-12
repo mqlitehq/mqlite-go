@@ -450,13 +450,15 @@ func parseRetryAfter(header http.Header, receivedAt time.Time) (time.Duration, b
 // observeServerTime converts broker response time into a conservative upper
 // bound for server time when the response reached us. New brokers expose epoch
 // milliseconds; older brokers fall back to HTTP's second-resolution Date. The
-// full round trip is charged as uncertainty, even though only the response leg
-// elapsed after the server generated the header.
+// full round trip is charged except for the broker's measured lower bound on
+// processing before its timestamp. Keep the original full RPC RTT separately
+// for managed renewal scheduling and request budgets.
 func observeServerTime(header http.Header, started, received time.Time) (serverClockObservation, bool) {
 	roundTrip := received.Sub(started)
 	if roundTrip < 0 {
 		roundTrip = 0
 	}
+	uncertainty := responseClockUncertainty(header, roundTrip)
 	var serverTime time.Time
 	resolution := time.Millisecond
 	if value := header.Get(wire.ServerTimeHeader); value != "" {
@@ -479,10 +481,30 @@ func observeServerTime(header http.Header, started, received time.Time) (serverC
 	}
 	return serverClockObservation{
 		localAt:     received,
-		serverUpper: serverTime.Add(resolution).Add(roundTrip),
+		serverUpper: serverTime.Add(resolution).Add(uncertainty),
 		responseRTT: roundTrip,
 		resolution:  resolution,
 	}, true
+}
+
+// responseClockUncertainty keeps the full-RTT bound unless exactly one decimal
+// elapsed header supplies a valid broker-processing lower bound. Compare the
+// milliseconds before Duration conversion so overflow cannot widen a lease.
+func responseClockUncertainty(header http.Header, roundTrip time.Duration) time.Duration {
+	values := header[http.CanonicalHeaderKey(wire.ServerElapsedHeader)]
+	if len(values) != 1 || values[0] == "" {
+		return roundTrip
+	}
+	for i := 0; i < len(values[0]); i++ {
+		if values[0][i] < '0' || values[0][i] > '9' {
+			return roundTrip
+		}
+	}
+	millis, err := strconv.ParseUint(values[0], 10, 64)
+	if err != nil || millis > uint64(roundTrip/time.Millisecond) {
+		return roundTrip
+	}
+	return roundTrip - time.Duration(millis)*time.Millisecond
 }
 
 // localLeaseDeadline translates a broker wall-clock deadline onto the local
