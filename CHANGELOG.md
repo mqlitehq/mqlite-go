@@ -4,6 +4,10 @@
 
 ## v0.1.2 — 2026-11-11
 
+- Reject negative or positive sub-millisecond `Message.Abandon` delays before
+  sending an HTTP request (MQLITE-156). Zero remains immediate; valid positive
+  delays retain their existing millisecond precision and settlement identity.
+
 - Validate each received batch before exposing any message: reject null entries,
   nonpositive or repeated sequence numbers, and missing Peek-Lock fencing tokens.
   Preserve valid empty bodies, empty batches and tokenless ReceiveAndDelete.
