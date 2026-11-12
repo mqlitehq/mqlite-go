@@ -273,24 +273,37 @@ func (c *Client) renewBatchObserved(ctx context.Context, queue string, messages 
 // public single-message Renew route predates deadline responses, while
 // RenewBatch reports the committed lease deadline even for one item.
 func (c *Client) renewLease(ctx context.Context, message *Message) (renewalLease, error) {
-	results, observation, err := c.renewBatchObserved(ctx, message.queue, message)
+	results, err := c.renewInitialBatch(ctx, message.queue, []*Message{message})
 	if err != nil {
 		return renewalLease{}, err
 	}
-	if len(results) != 1 || !results[0].Ok {
+	if len(results) != 1 {
 		return renewalLease{}, ErrLockLost
 	}
-	lease := renewalLease{
-		responseRTT:      observation.responseRTT,
-		clockResolution:  observation.resolution,
-		clockUnavailable: observation.serverUpper.IsZero(),
+	return results[0].lease, results[0].err
+}
+
+func (c *Client) renewInitialBatch(ctx context.Context, queue string, messages []*Message) ([]initialRenewalResult, error) {
+	results, observation, err := c.renewBatchObserved(ctx, queue, messages...)
+	if err != nil {
+		return nil, err
 	}
-	if deadline, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
-		lease.deadline = deadline
-		return lease, nil
+	confirmed := make([]initialRenewalResult, len(results))
+	for i, result := range results {
+		if !result.Ok {
+			confirmed[i].err = ErrLockLost
+			continue
+		}
+		lease := renewalLease{responseRTT: observation.responseRTT, clockResolution: observation.resolution,
+			clockUnavailable: observation.serverUpper.IsZero()}
+		if deadline, ok := observation.localLeaseDeadline(result.LockedUntil); ok {
+			lease.deadline = deadline
+		} else {
+			lease.deadline = result.LockedUntil
+		}
+		confirmed[i].lease = lease
 	}
-	lease.deadline = results[0].LockedUntil
-	return lease, nil
+	return confirmed, nil
 }
 
 // Receive claims messages with Peek-Lock by default. Pick retrieves deferred

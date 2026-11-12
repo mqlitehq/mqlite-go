@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Confirm received messages that need an initial lease check in one fenced
+  `RenewBatch` request before dispatching handlers. Preserve the earliest
+  original watchdog and each message's ownership checks; older brokers retain
+  bounded, ordered single-message confirmation (MQLITE-183).
+
 - With auto-renew enabled, protect a returned handler's lease through the existing
   bounded Complete/Abandon confirmation budget, including Run cancellation during
   settlement. Resolve a post-commit renewal loss through the exact settlement

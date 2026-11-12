@@ -4550,3 +4550,797 @@ func TestReceiverSettlementAttemptTimeoutAndPermanentBoundary(t *testing.T) {
 		}
 	}
 }
+
+// TestReceiverInitialConfirmationBatchFitsSharedLease models one remote writer
+// already occupied for 400ms followed by 350ms renewal statements. Four
+// separately confirmed deliveries cannot all fit their original 1.5s lease;
+// one set-based confirmation can, without relaxing an item's watchdog.
+func TestReceiverInitialConfirmationBatchFitsSharedLease(t *testing.T) {
+	const messages = 4
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var receiveCalls, renewalRequests, handlerCalls, completeCalls int
+	var batchSizes []int
+	var observed []error
+	deadlines := make(map[int64]time.Time)
+	handled := make(map[int64]int)
+	completed := make(map[int64]int)
+	writePermit := make(chan struct{}, 1)
+	writePermit <- struct{}{}
+	var occupied sync.Once
+	allComplete := make(chan struct{})
+	failed := make(chan error, 1)
+	serverStop := make(chan struct{})
+	writeJSON := func(w http.ResponseWriter, started time.Time, value interface{}) {
+		now := time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+		w.Header().Set(wire.ServerElapsedHeader, strconv.FormatInt(now.Sub(started).Nanoseconds()/int64(time.Millisecond), 10))
+		_ = json.NewEncoder(w).Encode(value)
+	}
+	wait := func(call context.Context, duration time.Duration) bool {
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return true
+		case <-call.Done():
+			return false
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		started := time.Now()
+		switch req.URL.Path {
+		case wire.PathReceive:
+			var receive wire.ReceiveRequest
+			if err := json.NewDecoder(req.Body).Decode(&receive); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			receiveCalls++
+			call := receiveCalls
+			mu.Unlock()
+			if call == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "unavailable", Message: "retry the same receive attempt"})
+				return
+			}
+			if call > 2 {
+				select {
+				case <-req.Context().Done():
+				case <-serverStop:
+				}
+				return
+			}
+			deadline := time.Now().Add(1500 * time.Millisecond)
+			response := wire.ReceiveResponse{}
+			mu.Lock()
+			for i := 1; i <= messages; i++ {
+				sequence := int64(i)
+				deadlines[sequence] = deadline
+				response.Messages = append(response.Messages, wire.Message{SeqNumber: sequence, LockToken: fmt.Sprintf("token-%d", i), DeliveryCount: 1, MessageID: fmt.Sprintf("message-%d", i), Body: []byte(fmt.Sprintf("payload-%d", i)), LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)})
+			}
+			mu.Unlock()
+			writeJSON(w, started, response)
+		case wire.PathRenewBatch:
+			var request wire.RenewBatchRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			renewalRequests++
+			batchSizes = append(batchSizes, len(request.Messages))
+			mu.Unlock()
+			select {
+			case <-writePermit:
+			case <-req.Context().Done():
+				return
+			}
+			defer func() { writePermit <- struct{}{} }()
+			ready := true
+			occupied.Do(func() { ready = wait(req.Context(), 400*time.Millisecond) })
+			if !ready || !wait(req.Context(), 350*time.Millisecond) {
+				return
+			}
+			response := wire.RenewBatchResponse{}
+			now := time.Now()
+			mu.Lock()
+			for _, item := range request.Messages {
+				result := wire.SettleItemResult{SeqNumber: item.SeqNumber}
+				if item.LockToken == fmt.Sprintf("token-%d", item.SeqNumber) && deadlines[item.SeqNumber].After(now) {
+					result.Ok = true
+					deadlines[item.SeqNumber] = now.Add(3 * time.Second)
+					result.LockedUntilMs = deadlines[item.SeqNumber].UnixNano() / int64(time.Millisecond)
+				}
+				response.Results = append(response.Results, result)
+			}
+			mu.Unlock()
+			writeJSON(w, started, response)
+		case wire.PathComplete:
+			var request wire.SettleRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			if request.LockToken != fmt.Sprintf("token-%d", request.SeqNumber) || !deadlines[request.SeqNumber].After(time.Now()) {
+				mu.Unlock()
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			completed[request.SeqNumber]++
+			completeCalls++
+			count := completeCalls
+			mu.Unlock()
+			writeJSON(w, started, wire.SettleResponse{Ok: true})
+			if count == messages {
+				close(allComplete)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	defer close(serverStop)
+	client, err := Open(ctx, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Receiver("q", WithConcurrency(messages), WithPrefetch(messages), WithAutoRenew(), WithErrorHandler(func(err error) {
+			mu.Lock()
+			observed = append(observed, err)
+			mu.Unlock()
+			select {
+			case failed <- err:
+			default:
+			}
+		})).Run(ctx, func(handlerCtx context.Context, message *Message) error {
+			mu.Lock()
+			handlerCalls++
+			handled[message.SequenceNumber]++
+			mu.Unlock()
+			if message.MessageID != fmt.Sprintf("message-%d", message.SequenceNumber) || string(message.Body) != fmt.Sprintf("payload-%d", message.SequenceNumber) || message.DeliveryCount != 1 {
+				return errors.New("delivery identity differs")
+			}
+			if !wait(handlerCtx, 20*time.Millisecond) {
+				return handlerCtx.Err()
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-allComplete:
+	case <-failed:
+	case <-ctx.Done():
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want caller cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not join")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(observed) != 0 || handlerCalls != messages || completeCalls != messages {
+		t.Fatalf("valid shared-budget batch failed: handlers=%d complete=%d errors=%v renewRequests=%d batchSizes=%v", handlerCalls, completeCalls, observed, renewalRequests, batchSizes)
+	}
+	for i := 1; i <= messages; i++ {
+		if handled[int64(i)] != 1 || completed[int64(i)] != 1 {
+			t.Fatalf("sequence %d handled/completed %d/%d", i, handled[int64(i)], completed[int64(i)])
+		}
+	}
+	if renewalRequests != 1 || len(batchSizes) != 1 || batchSizes[0] != messages {
+		t.Fatalf("initial confirmation requests=%d batchSizes=%v, want one batch of four", renewalRequests, batchSizes)
+	}
+}
+
+type initialBatchSource struct {
+	*deadlineLeaseSource
+	batchFn  func(context.Context, []*Message) ([]initialRenewalResult, error)
+	legacyFn func(context.Context, int64) error
+}
+
+func (s *initialBatchSource) renewInitialBatch(ctx context.Context, _ string, messages []*Message) ([]initialRenewalResult, error) {
+	return s.batchFn(ctx, messages)
+}
+
+func (s *initialBatchSource) renew(ctx context.Context, queue string, seq int64, token string) error {
+	if s.legacyFn != nil {
+		return s.legacyFn(ctx, seq)
+	}
+	return s.fakeReceiveSource.renew(ctx, queue, seq, token)
+}
+
+func initialBatchMessages(source *initialBatchSource, count int) []*Message {
+	messages := make([]*Message, count)
+	for i := range messages {
+		message := source.fakeReceiveSource.message(int64(i + 1))
+		message.s = source
+		message.LockedUntil = time.Now().Add(time.Second)
+		message.localLeaseDeadline = message.LockedUntil
+		message.leaseResponseRTT = time.Second
+		message.leaseClockResolution = time.Millisecond
+		messages[i] = message
+	}
+	return messages
+}
+
+func TestInitialConfirmationBatchValidatesEveryWireResult(t *testing.T) {
+	for _, name := range []string{"partial", "missing", "wrong sequence", "invalid deadline"} {
+		t.Run(name, func(t *testing.T) {
+			var calls int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				var body wire.RenewBatchRequest
+				if request.URL.Path != wire.PathRenewBatch || json.NewDecoder(request.Body).Decode(&body) != nil || len(body.Messages) != 2 {
+					t.Error("initial confirmation changed its single batch request")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				atomic.AddInt32(&calls, 1)
+				deadline := time.Now().Add(time.Second).UnixNano() / int64(time.Millisecond)
+				results := []wire.SettleItemResult{{SeqNumber: 1, Ok: true, LockedUntilMs: deadline}, {SeqNumber: 2}}
+				switch name {
+				case "missing":
+					results = results[:1]
+				case "wrong sequence":
+					results[1].SeqNumber = 1
+				case "invalid deadline":
+					results[0].LockedUntilMs = 0
+				}
+				w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
+				_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: results})
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages := []*Message{client.Message("q", 1, "one"), client.Message("q", 2, "two")}
+			results, err := client.renewInitialBatch(context.Background(), "q", messages)
+			if atomic.LoadInt32(&calls) != 1 {
+				t.Fatal("initial confirmation was not one request")
+			}
+			if name != "partial" {
+				if !errors.Is(err, ErrOutcomeUnknown) || results != nil {
+					t.Fatalf("malformed confirmation accepted: results=%v err=%v", results, err)
+				}
+				return
+			}
+			if err != nil || len(results) != 2 || results[0].err != nil || !results[0].lease.deadline.After(time.Now()) || !errors.Is(results[1].err, ErrLockLost) {
+				t.Fatalf("partial ownership was not fenced per item: results=%v err=%v", results, err)
+			}
+			if !messages[0].LockedUntil.IsZero() || !messages[1].LockedUntil.IsZero() {
+				t.Fatal("initial confirmation mutated the public message deadline")
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationBatchFailureStopsBeforeDispatch(t *testing.T) {
+	for _, status := range []int{401, 403, 503} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			var runCtx context.Context
+			var batchCalls, handlers, callbacks int32
+			base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+				if n == 1 {
+					runCtx = call
+					return messages, nil
+				}
+				<-call.Done()
+				return nil, call.Err()
+			}
+			responseErr := &HTTPError{StatusCode: status, cause: ErrPermissionDenied}
+			source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+				atomic.AddInt32(&batchCalls, 1)
+				return nil, responseErr
+			}
+			r := newReceiver(source, "q", []ReceiverOption{WithAutoRenew(), WithConcurrency(2), WithErrorHandler(func(error) {
+				atomic.AddInt32(&callbacks, 1)
+				if status != 503 && runCtx.Err() == nil {
+					t.Error("permanent batch error notified before stopping Run")
+				}
+				if status == 503 && runCtx.Err() != nil && ctx.Err() == nil {
+					t.Error("503 permission body became a permanent Run failure")
+				}
+				cancel()
+			})})
+			err := r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+			if atomic.LoadInt32(&handlers) != 0 || atomic.LoadInt32(&batchCalls) != 1 || atomic.LoadInt32(&callbacks) == 0 || len(base.settleSnapshot()) != 0 {
+				t.Fatal("failed batch reached a handler, settlement or another batch probe")
+			}
+			if status != 503 && (err != responseErr || len(base.receiveSnapshot()) != 1) {
+				t.Fatalf("permanent batch error did not fence Run: %v", err)
+			}
+			if status == 503 && !errors.Is(err, context.Canceled) {
+				t.Fatalf("503 no longer follows per-item fail-closed semantics: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationLegacyOrderReleasesBeforeHandlers(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 3)
+	now := time.Now()
+	messages[0].localLeaseDeadline = now.Add(900 * time.Millisecond)
+	messages[1].localLeaseDeadline = now.Add(500 * time.Millisecond)
+	messages[2].localLeaseDeadline = now.Add(700 * time.Millisecond)
+	var probes int32
+	source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+		atomic.AddInt32(&probes, 1)
+		return nil, ErrUnsupported
+	}
+	var mu sync.Mutex
+	var order []int64
+	allRenewed := make(chan struct{})
+	source.legacyFn = func(_ context.Context, seq int64) error {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, seq)
+		if len(order) == 3 {
+			close(allRenewed)
+		}
+		return nil
+	}
+	r := newReceiver(source, "q", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	plans, err := r.prepareInitialRenewals(ctx, messages, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseHandlers := make(chan struct{})
+	var workers sync.WaitGroup
+	for i, message := range messages {
+		workers.Add(1)
+		go func(message *Message, plan *initialRenewalPlan) {
+			defer workers.Done()
+			r.processWithHandlerRelease(ctx, message, func(context.Context, *Message) error { <-releaseHandlers; return nil }, func() {}, func(error) {}, true, plan)
+		}(message, plans[i])
+	}
+	select {
+	case <-allRenewed:
+	case <-ctx.Done():
+		close(releaseHandlers)
+		workers.Wait()
+		t.Fatal("a handler held the next initial confirmation")
+	}
+	close(releaseHandlers)
+	workers.Wait()
+	mu.Lock()
+	got := append([]int64(nil), order...)
+	mu.Unlock()
+	if len(got) != 3 || got[0] != 2 || got[1] != 3 || got[2] != 1 || len(base.settleSnapshot()) != 3 {
+		t.Fatalf("legacy confirmation order=%v", got)
+	}
+	_, err = r.prepareInitialRenewals(ctx, messages, true)
+	if err != nil || atomic.LoadInt32(&probes) != 1 {
+		t.Fatal("unsupported initial batch capability was not cached")
+	}
+}
+
+func TestInitialConfirmationUnsupportedProbeCannotResetWatchdog(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 2)
+	for _, message := range messages {
+		message.localLeaseDeadline = time.Now().Add(80 * time.Millisecond)
+	}
+	source.batchFn = func(ctx context.Context, _ []*Message) ([]initialRenewalResult, error) {
+		<-ctx.Done()
+		return nil, ErrUnsupported
+	}
+	var legacy, handlers, errorsSeen int32
+	source.legacyFn = func(context.Context, int64) error { atomic.AddInt32(&legacy, 1); return nil }
+	r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { atomic.AddInt32(&errorsSeen, 1) })})
+	plans, err := r.prepareInitialRenewals(context.Background(), messages, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.processWithHandlerRelease(context.Background(), messages[0], func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil }, func() {}, func(error) {}, true, plans[0])
+	if atomic.LoadInt32(&legacy) != 0 || atomic.LoadInt32(&handlers) != 0 || atomic.LoadInt32(&errorsSeen) != 1 {
+		t.Fatal("404 retry widened an exhausted original watchdog")
+	}
+}
+
+func TestInitialConfirmationLateAckAndPartialResults(t *testing.T) {
+	for _, kind := range []string{"partial", "malformed", "late acknowledgement", "expired acknowledgement", "goexit"} {
+		t.Run(kind, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			if kind == "late acknowledgement" {
+				for _, message := range messages {
+					message.localLeaseDeadline = time.Now().Add(80 * time.Millisecond)
+				}
+			}
+			source.batchFn = func(ctx context.Context, messages []*Message) ([]initialRenewalResult, error) {
+				if kind == "goexit" {
+					runtime.Goexit()
+				}
+				if kind == "late acknowledgement" {
+					<-ctx.Done()
+				}
+				deadline := time.Now().Add(time.Second)
+				if kind == "expired acknowledgement" {
+					deadline = time.Now().Add(-time.Millisecond)
+				}
+				results := make([]initialRenewalResult, len(messages))
+				for i := range results {
+					results[i].lease = renewalLease{deadline: deadline, clockResolution: time.Millisecond}
+				}
+				if kind == "partial" {
+					results[1].err = ErrLockLost
+				}
+				if kind == "malformed" {
+					results = results[:1]
+				}
+				return results, nil
+			}
+			var handlers, errorsSeen int32
+			r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { atomic.AddInt32(&errorsSeen, 1) })})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				plans, err := r.prepareInitialRenewals(context.Background(), messages, true)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				for i, message := range messages {
+					r.processWithHandlerRelease(context.Background(), message, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil }, func() {}, func(error) {}, true, plans[i])
+				}
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial batch invocation did not join")
+			}
+			wantHandlers := int32(0)
+			if kind == "partial" {
+				wantHandlers = 1
+			}
+			if atomic.LoadInt32(&handlers) != wantHandlers || len(base.settleSnapshot()) != int(wantHandlers) || atomic.LoadInt32(&errorsSeen) != 2-wantHandlers {
+				t.Fatalf("prepared acknowledgement escaped its fence: handlers=%d errors=%d", handlers, errorsSeen)
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationRunCancellationJoinsBatch(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+		if n == 1 {
+			return messages, nil
+		}
+		<-call.Done()
+		return nil, call.Err()
+	}
+	started, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	source.batchFn = func(call context.Context, _ []*Message) ([]initialRenewalResult, error) {
+		close(started)
+		<-call.Done()
+		close(canceled)
+		<-release
+		return []initialRenewalResult{{lease: renewalLease{deadline: time.Now().Add(time.Hour)}}, {lease: renewalLease{deadline: time.Now().Add(time.Hour)}}}, nil
+	}
+	var handlers, errorsSeen int32
+	r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithErrorHandler(func(error) { atomic.AddInt32(&errorsSeen, 1) })})
+	// A Receive replay forces the initial fence without requiring auto-renew.
+	first := true
+	originalReceive := base.receiveFn
+	base.receiveFn = func(call context.Context, n int, record receiveRecord) ([]*Message, error) {
+		if first {
+			first = false
+			return nil, &HTTPError{StatusCode: 503}
+		}
+		return originalReceive(call, n-1, record)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+	}()
+	<-started
+	cancel()
+	<-canceled
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("Run detached its canceled initial batch")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not join the initial batch")
+	}
+	if handlers != 0 || errorsSeen != 0 || len(base.settleSnapshot()) != 0 {
+		t.Fatal("late canceled batch acknowledgement dispatched work")
+	}
+}
+
+func TestInitialConfirmationOversizedGroupUsesOrderedFallback(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	var batchCalls int32
+	source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+		atomic.AddInt32(&batchCalls, 1)
+		return nil, ErrInvalidArgument
+	}
+	messages := initialBatchMessages(source, MaxRenewBatch+1)
+	r := newReceiver(source, "q", nil)
+	plans, err := r.prepareInitialRenewals(context.Background(), messages, true)
+	if err != nil || atomic.LoadInt32(&batchCalls) != 0 || len(plans) != len(messages) {
+		t.Fatal("large custom-source receive became a rejected renewal batch")
+	}
+	for i, plan := range plans {
+		if plan == nil || plan.result != nil || plan.done == nil || (i > 0 && plan.previous != plans[i-1].done) {
+			t.Fatal("large custom-source receive lost its ordered fallback")
+		}
+	}
+}
+
+func TestInitialConfirmationAbnormalLegacyExitReleasesNextItem(t *testing.T) {
+	for _, kind := range []string{"goexit", "panic"} {
+		t.Run(kind, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			source.legacyFn = func(_ context.Context, seq int64) error {
+				if seq == 1 {
+					if kind == "goexit" {
+						runtime.Goexit()
+					}
+					panic("synthetic initial confirmation panic")
+				}
+				return nil
+			}
+			r := newReceiver(source, "q", nil)
+			r.renewBatchUnsupported = true
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			plans, err := r.prepareInitialRenewals(ctx, messages, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var workers sync.WaitGroup
+			var handlers, panics int32
+			for i, message := range messages {
+				workers.Add(1)
+				go func(message *Message, plan *initialRenewalPlan) {
+					defer workers.Done()
+					defer func() {
+						if recover() != nil {
+							atomic.AddInt32(&panics, 1)
+						}
+					}()
+					r.processWithHandlerRelease(ctx, message, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil }, func() {}, func(error) {}, true, plan)
+				}(message, plans[i])
+			}
+			joined := make(chan struct{})
+			go func() { workers.Wait(); close(joined) }()
+			select {
+			case <-joined:
+			case <-ctx.Done():
+				t.Fatal("abnormal initial confirmation stranded its successor")
+			}
+			if handlers != 1 || len(base.settleSnapshot()) != 1 || (kind == "panic" && panics != 1) {
+				t.Fatal("abnormal initial confirmation changed handler or cleanup behavior")
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationDuplicateSelectedMessagesAreRejected(t *testing.T) {
+	for _, kind := range []string{"same pointer", "same positive sequence", "same zero-sequence pointer"} {
+		t.Run(kind, func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			switch kind {
+			case "same pointer":
+				messages[1] = messages[0]
+			case "same positive sequence":
+				messages[1].SequenceNumber = messages[0].SequenceNumber
+			case "same zero-sequence pointer":
+				messages[0].SequenceNumber = 0
+				messages[1] = messages[0]
+			}
+			var calls, handlers, callbacks int32
+			var runCtx context.Context
+			source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+				atomic.AddInt32(&calls, 1)
+				return nil, nil
+			}
+			base.receiveFn = func(ctx context.Context, _ int, _ receiveRecord) ([]*Message, error) {
+				runCtx = ctx
+				return messages, nil
+			}
+			r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(error) {
+				atomic.AddInt32(&callbacks, 1)
+				if runCtx.Err() == nil {
+					t.Error("malformed selected batch did not stop Run before notification")
+				}
+			})})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+			if !errors.Is(err, ErrInvalidArgument) || calls != 0 || handlers != 0 || callbacks != 1 || len(base.receiveSnapshot()) != 1 || len(base.settleSnapshot()) != 0 {
+				t.Fatal("malformed selected batch reached renewal, handler or settlement")
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationPerItemStatusRespectsRunBoundary(t *testing.T) {
+	for _, status := range []int{403, 503} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var runCtx context.Context
+			base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+				if n == 1 {
+					runCtx = call
+					return messages, nil
+				}
+				<-call.Done()
+				return nil, call.Err()
+			}
+			responseErr := &HTTPError{StatusCode: status, cause: ErrPermissionDenied}
+			source.batchFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+				return []initialRenewalResult{
+					{lease: renewalLease{deadline: time.Now().Add(time.Second), clockResolution: time.Millisecond}},
+					{err: responseErr},
+				}, nil
+			}
+			var handlers, invalidHandlers, callbacks int32
+			r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(error) {
+				atomic.AddInt32(&callbacks, 1)
+				if status == 403 && runCtx.Err() == nil {
+					t.Error("per-item permanent error was notified before stopping Run")
+				}
+				if status == 503 && ctx.Err() == nil && runCtx.Err() != nil {
+					t.Error("per-item 503 permission body became permanent")
+				}
+				cancel()
+			})})
+			err := r.Run(ctx, func(_ context.Context, message *Message) error {
+				atomic.AddInt32(&handlers, 1)
+				if message.SequenceNumber == 2 {
+					atomic.AddInt32(&invalidHandlers, 1)
+				}
+				return nil
+			})
+			if callbacks == 0 || invalidHandlers != 0 {
+				t.Fatal("unconfirmed per-item result was dispatched or silently dropped")
+			}
+			if status == 403 && (err != responseErr || handlers != 0 || len(base.settleSnapshot()) != 0 || len(base.receiveSnapshot()) != 1) {
+				t.Fatal("per-item permanent error did not fence the whole dispatch")
+			}
+			if status == 503 && !errors.Is(err, context.Canceled) {
+				t.Fatalf("per-item transient error stopped Run permanently: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitialConfirmationLateUnsupportedFailsWindowWithoutStoppingRun(t *testing.T) {
+	base := &fakeReceiveSource{}
+	source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+	messages := initialBatchMessages(source, 2)
+	deadline := time.Now().Add(80 * time.Millisecond)
+	for _, message := range messages {
+		message.localLeaseDeadline = deadline
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var runCtx context.Context
+	base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+		if n == 1 {
+			runCtx = call
+			return messages, nil
+		}
+		<-call.Done()
+		return nil, call.Err()
+	}
+	source.batchFn = func(call context.Context, _ []*Message) ([]initialRenewalResult, error) {
+		<-call.Done()
+		return nil, &HTTPError{StatusCode: 404, cause: ErrUnsupported}
+	}
+	var legacy, handlers, callbacks int32
+	source.legacyFn = func(context.Context, int64) error { atomic.AddInt32(&legacy, 1); return nil }
+	r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(err error) {
+		atomic.AddInt32(&callbacks, 1)
+		if !errors.Is(err, ErrLockLost) || (ctx.Err() == nil && runCtx.Err() != nil) {
+			t.Error("late unsupported probe replaced lease expiry with a fatal capability error")
+		}
+		cancel()
+	})})
+	err := r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+	if !errors.Is(err, context.Canceled) || legacy != 0 || handlers != 0 || callbacks == 0 || len(base.settleSnapshot()) != 0 {
+		t.Fatal("late unsupported probe acquired a fresh watchdog or dispatched work")
+	}
+}
+
+func TestInitialConfirmationCallerCancellationPreservesCanceled(t *testing.T) {
+	for _, status := range []int{404, 403} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			base := &fakeReceiveSource{}
+			source := &initialBatchSource{deadlineLeaseSource: &deadlineLeaseSource{fakeReceiveSource: base}}
+			messages := initialBatchMessages(source, 2)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			base.receiveFn = func(call context.Context, n int, _ receiveRecord) ([]*Message, error) {
+				if n == 1 {
+					return messages, nil
+				}
+				<-call.Done()
+				return nil, call.Err()
+			}
+			started := make(chan struct{})
+			source.batchFn = func(call context.Context, _ []*Message) ([]initialRenewalResult, error) {
+				close(started)
+				<-call.Done()
+				cause := ErrPermissionDenied
+				if status == 404 {
+					cause = ErrUnsupported
+				}
+				return nil, &HTTPError{StatusCode: status, cause: cause}
+			}
+			var handlers, callbacks int32
+			r := newReceiver(source, "q", []ReceiverOption{WithConcurrency(2), WithAutoRenew(), WithErrorHandler(func(error) { atomic.AddInt32(&callbacks, 1) })})
+			done := make(chan error, 1)
+			go func() {
+				done <- r.Run(ctx, func(context.Context, *Message) error { atomic.AddInt32(&handlers, 1); return nil })
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("initial batch did not start")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("late HTTP %d replaced caller cancellation: %v", status, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("canceled initial batch did not join")
+			}
+			if handlers != 0 || callbacks != 0 || len(base.settleSnapshot()) != 0 {
+				t.Fatal("canceled initial batch dispatched or reported a stale response")
+			}
+		})
+	}
+}
