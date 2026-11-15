@@ -88,3 +88,7 @@ at a green main commit, and publishes only binaries built with supported stable.
 Keep tests grouped by concern rather than creating one file per method. Prefer
 small explicit code over abstractions that raise the language floor or hide wire
 semantics.
+
+Receiver unit tests, bounded soak tests, and benchmarks belong together in
+`receiver_test.go`. Keep tests for each existing source concern in its matching
+test file. Split files only when package or build constraints require it.
