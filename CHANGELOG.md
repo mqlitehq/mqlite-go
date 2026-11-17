@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-## v0.1.2 — 2026-11-11
+## v0.1.2 — 2026-11-17
+
+Published with maintainer-approved bounded qualification. The planned 24/48-hour
+acceptance and eight spaced Turso windows were not completed; see the
+[release notes](https://github.com/mqlitehq/mqlite-go/releases/tag/v0.1.2) for the
+completed verification and its limits.
 
 - Reject negative or positive sub-millisecond `Message.Abandon` delays before
   sending an HTTP request (MQLITE-156). Zero remains immediate; valid positive

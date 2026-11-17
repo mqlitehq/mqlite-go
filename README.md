@@ -16,12 +16,19 @@ when the application only talks to a broker over HTTP and a low Go floor matters
 
 ## Install
 
-This source prepares v0.1.2. Confirm its tag on
-[Releases](https://github.com/mqlitehq/mqlite-go/releases) before installing.
+The current published release is
+[v0.1.2](https://github.com/mqlitehq/mqlite-go/releases/tag/v0.1.2).
+Use its [tagged documentation](https://github.com/mqlitehq/mqlite-go/tree/v0.1.2/docs)
+for the exact release snapshot; `main` may include later documentation corrections.
 
 ```sh
 go get github.com/mqlitehq/mqlite-go@v0.1.2
 ```
+
+For CLI archives, checksums and a repeatable version-pinned installation, see
+[post-release verification](docs/releasing.md#verify-the-published-release).
+The release notes disclose the maintainer-approved bounded qualification and
+the incomplete 24/48-hour and eight-window plan.
 
 The module declares `go 1.13` and is tested with Go 1.13.15, Go 1.18.10, and
 current stable. Go 1.13 itself is end-of-life: this is a source compatibility

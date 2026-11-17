@@ -18,8 +18,13 @@ Apple Silicon release artifacts.
 
 ## Broker compatibility
 
-The v0.1.2 release-target client is blackbox-tested against the exact
-`ghcr.io/mqlitehq/mqlite:0.4.1` broker image. Core queue calls use the stable
+The released [v0.1.2 client](https://github.com/mqlitehq/mqlite-go/releases/tag/v0.1.2)
+is blackbox-tested in CI against the exact `ghcr.io/mqlitehq/mqlite:0.4.1`
+broker image. Post-release verification also installed the public v0.1.2 and
+broker v0.4.3 modules, checked their production source against the tags, and
+passed eight broker/native-client/standalone-client scenarios without local
+module replacements. The ongoing CI compatibility baseline remains v0.4.1.
+Core queue calls use the stable
 JSON-over-HTTP routes shared by MQLite clients. Lifecycle-aware queue/subscription
 deletion, fixed subscription TTL, and paged subscription inventory require a
 broker that implements those routes (v0.4.0 or later).
