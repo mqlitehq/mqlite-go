@@ -1,7 +1,13 @@
 # Release process
 
-Releases are immutable tags and GitHub Releases. The Go module proxy discovers
-the same tag; no separate package upload exists.
+Releases use permanent version tags and GitHub Releases. The Go module proxy
+discovers the same tag; no separate package upload exists.
+
+Do not infer server-enforced immutability from an annotated tag or a workflow
+step name. [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+are a separate repository setting. The published v0.1.2 release is not marked
+immutable by GitHub; the project policy still forbids moving published tags or
+replacing published assets.
 
 ## Before tagging
 
@@ -34,5 +40,46 @@ and stripped. No Go 1.13-built binary is published.
 After publication, verify the release checksums, install one archive, run
 `mqlitec version`, and run a broker round-trip. Query the module through the Go
 proxy so pkg.go.dev and downstream users can discover the tag.
+
+## Verify the published release
+
+The current client release is
+[v0.1.2](https://github.com/mqlitehq/mqlite-go/releases/tag/v0.1.2).
+Download the archive for your OS/architecture and `SHA256SUMS` from that page,
+check its SHA256 against the named checksum entry, then run `mqlitec version`.
+The reported version must be `0.1.2`.
+
+To build the same published version with a supported current Go toolchain:
+
+```sh
+go install github.com/mqlitehq/mqlite-go/cmd/mqlitec@v0.1.2
+mqlitec version
+go list -m -json github.com/mqlitehq/mqlite-go@v0.1.2
+```
+
+Use the installed binary from `GOBIN`, or `$(go env GOPATH)/bin` when `GOBIN`
+is unset. These commands query a published module version rather than a local
+checkout. The source floor remains Go 1.13; official binaries use supported
+current stable Go.
+
+For a broker round-trip, create a disposable queue with an administrator, then
+inject a producer/consumer credential through the environment:
+
+```sh
+export MQLITE_ENDPOINT=http://127.0.0.1:6754
+export MQLITE_TOKEN='<test-credential>'
+mqlitec send release-check 'release-check-body'
+mqlitec receive --max 1 --wait 1s release-check
+mqlitec receive --max 1 --wait 10ms release-check
+```
+
+The first receive must print the expected body; the second must be empty after
+successful auto-settlement. Use a disposable broker/queue for this check and
+account for its messages before deleting it. Token scopes and the output-before-
+settlement boundary remain as documented in [the CLI reference](cli.md).
+
+The v0.1.2 release notes disclose the maintainer-approved bounded verification.
+The planned 24/48-hour acceptance and eight spaced Turso windows were not
+completed; these install and round-trip checks do not turn that plan into a pass.
 
 Never move or reuse a published tag. Correct a bad release with a new patch.
